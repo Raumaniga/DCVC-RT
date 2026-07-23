@@ -879,8 +879,33 @@ def train_stage3(args):
     epochs_without_improvement = 0
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Khôi phục trạng thái nếu có resume
+    start_epoch = 1
+    if args.resume_ckpt and os.path.exists(args.resume_ckpt):
+        print(f"  🔄 Đang nạp lại trạng thái (Resume) từ: {args.resume_ckpt}")
+        ckpt_data = torch.load(args.resume_ckpt, map_location=device)
+        
+        # Lấy lại weights
+        if 'dmci_state_dict' in ckpt_data:
+            dmci.load_state_dict(ckpt_data['dmci_state_dict'])
+        if 'dmc_state_dict' in ckpt_data:
+            dmc.load_state_dict(ckpt_data['dmc_state_dict'])
+        if 'front_end_trainable_state_dict' in ckpt_data:
+            criterion.front_end_trainable.load_state_dict(ckpt_data['front_end_trainable_state_dict'])
+            
+        # Lấy lại optimizer và tính toán epoch
+        if 'optimizer_state_dict' in ckpt_data:
+            optimizer.load_state_dict(ckpt_data['optimizer_state_dict'])
+        if 'epoch' in ckpt_data:
+            start_epoch = ckpt_data['epoch'] + 1
+        
+        if 'train_metrics' in ckpt_data and 'total_loss' in ckpt_data['train_metrics']:
+            best_loss = ckpt_data['train_metrics']['total_loss']
+            
+        print(f"  ✅ Sẽ tiếp tục chạy từ Epoch {start_epoch}")
+
     # ── Training Loop ──
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         dmci.train()
         dmc.train()
         criterion.train()
