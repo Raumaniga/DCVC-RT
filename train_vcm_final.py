@@ -205,10 +205,13 @@ class TrainingLogger:
 
 @torch.no_grad()
 def validate_stage1(model, criterion, dataloader, device, qp_list=None):
-    """Validation cho Stage 1 (DMCI I-frame)."""
+    """Validation cho Stage 1 (DMCI I-frame).
+    
+    QP được bốc ngẫu nhiên từ [0, 63] mỗi batch, giống hệt phân phối
+    trong training loop, để đảm bảo train_loss và val_loss có thể so sánh
+    trực tiếp trên cùng một phân phối QP.
+    """
     model.eval()
-    if qp_list is None:
-        qp_list = [0, 16, 32, 48]
 
     accum = {
         'total_loss': 0.0, 'rate_bpp': 0.0, 'feature_mse': 0.0,
@@ -219,7 +222,7 @@ def validate_stage1(model, criterion, dataloader, device, qp_list=None):
     for frames in dataloader:
         frames = frames.to(device)
         x = frames[:, 0, :, :, :]
-        qp = random.choice(qp_list)
+        qp = random.randint(0, 63)  # Cùng phân phối với training
 
         x_hat, rate_bpp = model.forward_train(x, qp)
         details = criterion(x, x_hat, rate_bpp, return_details=True)
@@ -237,10 +240,13 @@ def validate_stage1(model, criterion, dataloader, device, qp_list=None):
 
 @torch.no_grad()
 def validate_stage2(dmci, dmc, criterion, dataloader, device, qp_list=None):
-    """Validation cho Stage 2 (DMC P-frame, DMCI frozen)."""
+    """Validation cho Stage 2 (DMC P-frame, DMCI frozen).
+    
+    QP được bốc ngẫu nhiên từ [0, 63] mỗi batch, giống hệt phân phối
+    trong training loop, để đảm bảo train_loss và val_loss có thể so sánh
+    trực tiếp trên cùng một phân phối QP.
+    """
     dmc.eval()
-    if qp_list is None:
-        qp_list = [0, 16, 32, 48]
 
     accum = {
         'total_loss': 0.0, 'rate_bpp': 0.0, 'feature_mse': 0.0,
@@ -251,7 +257,7 @@ def validate_stage2(dmci, dmc, criterion, dataloader, device, qp_list=None):
     for frames in dataloader:
         frames = frames.to(device)
         T = frames.size(1)
-        qp = random.choice(qp_list)
+        qp = random.randint(0, 63)  # Cùng phân phối với training
 
         # I-frame
         x_0 = frames[:, 0, :, :, :]
@@ -280,11 +286,14 @@ def validate_stage2(dmci, dmc, criterion, dataloader, device, qp_list=None):
 
 @torch.no_grad()
 def validate_stage3(dmci, dmc, criterion, dataloader, device, qp_list=None):
-    """Validation cho Stage 3 (Joint DMCI+DMC)."""
+    """Validation cho Stage 3 (Joint DMCI+DMC).
+    
+    QP được bốc ngẫu nhiên từ [0, 63] mỗi batch, giống hệt phân phối
+    trong training loop, để đảm bảo train_loss và val_loss có thể so sánh
+    trực tiếp trên cùng một phân phối QP.
+    """
     dmci.eval()
     dmc.eval()
-    if qp_list is None:
-        qp_list = [0, 16, 32, 48]
 
     accum = {
         'total_loss': 0.0, 'rate_bpp': 0.0, 'feature_mse': 0.0,
@@ -295,7 +304,7 @@ def validate_stage3(dmci, dmc, criterion, dataloader, device, qp_list=None):
     for frames in dataloader:
         frames = frames.to(device)
         T = frames.size(1)
-        qp = random.choice(qp_list)
+        qp = random.randint(0, 63)  # Cùng phân phối với training
 
         # I-frame
         x_0 = frames[:, 0, :, :, :]
