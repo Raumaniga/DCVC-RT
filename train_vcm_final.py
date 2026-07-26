@@ -479,7 +479,7 @@ def train_stage1(args):
 
             # Forward: DMCI → VCM Loss
             x_hat, rate_bpp = model.forward_train(x, qp)
-            details = criterion(x, x_hat, rate_bpp, return_details=True)
+            details = criterion(x, x_hat, rate_bpp, qp=qp, return_details=True)
             loss = details['total_loss']
 
             # Backward
@@ -717,7 +717,7 @@ def train_stage2(args):
             for t in range(1, T):
                 x_t = frames[:, t, :, :, :]
                 x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp)
-                details = criterion(x_t, x_hat_t, rate_bpp_t, return_details=True)
+                details = criterion(x_t, x_hat_t, rate_bpp_t, qp=qp, return_details=True)
 
                 batch_loss = batch_loss + details['total_loss']
                 for k in batch_details:
@@ -938,7 +938,7 @@ def train_stage3(args):
             # ── Frame 0: I-frame (DMCI, có gradient) ──
             x_0 = frames[:, 0, :, :, :]
             x_hat_0, rate_bpp_0 = dmci.forward_train(x_0, qp)
-            details_0 = criterion(x_0, x_hat_0, rate_bpp_0, return_details=True)
+            details_0 = criterion(x_0, x_hat_0, rate_bpp_0, qp=qp, return_details=True)
 
             dmc.clear_dpb()
             dmc.set_curr_poc(0)
@@ -952,7 +952,7 @@ def train_stage3(args):
             for t in range(1, T):
                 x_t = frames[:, t, :, :, :]
                 x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp)
-                details_t = criterion(x_t, x_hat_t, rate_bpp_t, return_details=True)
+                details_t = criterion(x_t, x_hat_t, rate_bpp_t, qp=qp, return_details=True)
 
                 batch_loss = batch_loss + details_t['total_loss']
                 for k in batch_details:

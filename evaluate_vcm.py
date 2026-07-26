@@ -297,8 +297,10 @@ def evaluate_vcm_performance(args):
             dmci.load_state_dict(ckpt['model_state_dict'])
         elif isinstance(ckpt, dict) and 'dmci_state_dict' in ckpt:
             dmci.load_state_dict(ckpt['dmci_state_dict'])
+        elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
+            dmci.load_state_dict(ckpt['state_dict'], strict=False)
         else:
-            dmci.load_state_dict(ckpt)
+            dmci.load_state_dict(ckpt, strict=False)
         print(f"  ✓ Loaded DMCI: {args.dmci_ckpt}")
     else:
         print(f"  ⚠️ Không tìm thấy DMCI checkpoint, dùng pretrained")
@@ -312,8 +314,10 @@ def evaluate_vcm_performance(args):
             dmc.load_state_dict(ckpt['model_state_dict'])
         elif isinstance(ckpt, dict) and 'dmc_state_dict' in ckpt:
             dmc.load_state_dict(ckpt['dmc_state_dict'])
+        elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
+            dmc.load_state_dict(ckpt['state_dict'], strict=False)
         else:
-            dmc.load_state_dict(ckpt)
+            dmc.load_state_dict(ckpt, strict=False)
         print(f"  ✓ Loaded DMC: {args.dmc_ckpt}")
     else:
         print(f"  ⚠️ Không tìm thấy DMC checkpoint, dùng pretrained")

@@ -33,12 +33,13 @@ class VCMLoss(nn.Module):
         self.front_end_original.eval()
         return self
 
-    def forward(self, x_uncompressed, x_reconstructed, rate_bpp, return_details=False):
+    def forward(self, x_uncompressed, x_reconstructed, rate_bpp, qp=None, return_details=False):
         """
         Đầu vào:
         - x_uncompressed: Ảnh RGB gốc (Shape: [Batch, 3, H, W], Range: [0, 1])
         - x_reconstructed: Ảnh RGB giải nén từ DCVC-RT (Base Frame)
         - rate_bpp: Số bit sinh ra trên mỗi pixel (bpp) được ước tính từ Entropy Model.
+        - qp: Quantization parameter index (0-63)
         - return_details: Nếu True, trả về dict chứa tất cả thông tin chi tiết cho logging.
         """
         # 1. Trích xuất đặc trưng (Features)
@@ -51,8 +52,18 @@ class VCMLoss(nn.Module):
         # 2. Tính Distortion (Mức độ méo mó của Feature thay vì Pixel)
         feature_mse = self.mse_loss(r_hat_t, r_t)
         
-        # 3. Tính Tổng Loss (R + lambda * D)
-        distortion_weighted = self.lambda_base * feature_mse
+        # 3. Dynamic Lambda Mapping (Gắn nhịp đập Loss với QP)
+        if qp is not None:
+            import math
+            lambda_max = 2048.0
+            lambda_min = 16.0
+            safe_qp = max(0.0, min(63.0, float(qp)))
+            ratio = safe_qp / 63.0
+            current_lambda = lambda_max * math.pow(lambda_min / lambda_max, ratio)
+        else:
+            current_lambda = self.lambda_base
+            
+        distortion_weighted = current_lambda * feature_mse
         total_loss = rate_bpp + distortion_weighted
         
         if return_details:
