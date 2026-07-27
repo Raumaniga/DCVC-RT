@@ -327,14 +327,46 @@ def evaluate_vcm_performance(args):
     dmci.eval()
     dmc.eval()
 
-    # ── VCM Feature Extractor (chỉ frozen original cho eval) ──
-    from src.models.yolov5_extractor import YOLOv5FeatureExtractor
-    feature_extractor = YOLOv5FeatureExtractor(
-        model_name=args.task_model,
-        extract_layer_idx=args.extract_layer_idx,
-        trainable=False,
-    ).to(device)
-    feature_extractor.eval()
+    # ── YOLOv5 Full Model for Accuracy (Pseudo-Ground Truth) ──
+    print(f"  Load Full YOLO Model ({args.task_model}) for Accuracy...")
+    try:
+        import torchvision
+    except ImportError:
+        print("  ⚠️ Không tìm thấy torchvision, hãy cài đặt bằng pip install torchvision")
+        return
+        
+    yolo_model = torch.hub.load('ultralytics/yolov5', args.task_model, pretrained=True).to(device)
+    yolo_model.eval()
+
+    def compute_yolo_accuracy(preds_orig, preds_comp, iou_thresh=0.5, conf_thresh=0.25):
+        p_o = preds_orig[preds_orig[:, 4] > conf_thresh]
+        p_c = preds_comp[preds_comp[:, 4] > conf_thresh]
+        total_orig = len(p_o)
+        total_comp = len(p_c)
+        if total_orig == 0:
+            return (1.0 if total_comp == 0 else 0.0)
+        if total_comp == 0:
+            return 0.0
+        ious = torchvision.ops.box_iou(p_o[:, :4], p_c[:, :4])
+        total_matches = 0
+        matched_c = set()
+        for i in range(len(p_o)):
+            cls_o = p_o[i, 5]
+            best_iou = 0
+            best_j = -1
+            for j in range(len(p_c)):
+                if j in matched_c:
+                    continue
+                if p_c[j, 5] == cls_o and ious[i, j] > iou_thresh:
+                    if ious[i, j] > best_iou:
+                        best_iou = ious[i, j]
+                        best_j = j
+            if best_j != -1:
+                matched_c.add(best_j)
+                total_matches += 1
+        precision = total_matches / total_comp if total_comp > 0 else 0.0
+        recall = total_matches / total_orig if total_orig > 0 else 0.0
+        return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
     # ── Dataset ──
     from src.utils.dataset import VimeoSeptupletDataset
@@ -377,20 +409,19 @@ def evaluate_vcm_performance(args):
                 x_0 = frames[:, 0, :, :, :]
                 x_hat_0, rate_bpp_0 = dmci.forward_train(x_0, qp)
 
-                # Feature MSE
-                r_orig = feature_extractor(x_0)
-                r_recon = feature_extractor(x_hat_0)
-                fmse_0 = F.mse_loss(r_recon, r_orig).item()
-
+                # YOLO Accuracy (F1-score)
+                preds_orig_0 = yolo_model(x_0).xyxy[0]
+                preds_recon_0 = yolo_model(x_hat_0).xyxy[0]
+                acc_0 = compute_yolo_accuracy(preds_orig_0, preds_recon_0)
                 # Pixel PSNR
                 mse_0 = F.mse_loss(x_hat_0, x_0).item()
                 psnr_0 = 10 * np.log10(1.0 / max(mse_0, 1e-10))
 
                 metrics['bpp_i'].append(rate_bpp_0.item())
-                metrics['feature_mse_i'].append(fmse_0)
+                metrics['feature_mse_i'].append(acc_0)
                 metrics['psnr_i'].append(psnr_0)
                 metrics['bpp_all'].append(rate_bpp_0.item())
-                metrics['feature_mse_all'].append(fmse_0)
+                metrics['feature_mse_all'].append(acc_0)
                 metrics['psnr_all'].append(psnr_0)
 
                 # P-frames
@@ -403,18 +434,18 @@ def evaluate_vcm_performance(args):
                         x_t = frames[:, t, :, :, :]
                         x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp)
 
-                        r_orig_t = feature_extractor(x_t)
-                        r_recon_t = feature_extractor(x_hat_t)
-                        fmse_t = F.mse_loss(r_recon_t, r_orig_t).item()
+                        preds_orig_t = yolo_model(x_t).xyxy[0]
+                        preds_recon_t = yolo_model(x_hat_t).xyxy[0]
+                        acc_t = compute_yolo_accuracy(preds_orig_t, preds_recon_t)
 
                         mse_t = F.mse_loss(x_hat_t, x_t).item()
                         psnr_t = 10 * np.log10(1.0 / max(mse_t, 1e-10))
 
                         metrics['bpp_p'].append(rate_bpp_t.item())
-                        metrics['feature_mse_p'].append(fmse_t)
+                        metrics['feature_mse_p'].append(acc_t)
                         metrics['psnr_p'].append(psnr_t)
                         metrics['bpp_all'].append(rate_bpp_t.item())
-                        metrics['feature_mse_all'].append(fmse_t)
+                        metrics['feature_mse_all'].append(acc_t)
                         metrics['psnr_all'].append(psnr_t)
 
         # Aggregate
@@ -428,9 +459,9 @@ def evaluate_vcm_performance(args):
     print(f"\n{'='*80}")
     print(f"  VCM Performance Results")
     print(f"{'='*80}")
-    print(f"  {'QP':>4} │ {'BPP (all)':>10} │ {'Feature MSE':>12} │ {'Pixel PSNR':>11} │ "
+    print(f"  {'QP':>4} │ {'BPP (all)':>10} │ {'Accuracy (F1)':>13} │ {'Pixel PSNR':>11} │ "
           f"{'BPP (I)':>9} │ {'BPP (P)':>9}")
-    print(f"  {'─'*4}─┼─{'─'*10}─┼─{'─'*12}─┼─{'─'*11}─┼─{'─'*9}─┼─{'─'*9}")
+    print(f"  {'─'*4}─┼─{'─'*10}─┼─{'─'*13}─┼─{'─'*11}─┼─{'─'*9}─┼─{'─'*9}")
 
     for qp in sorted(results.keys()):
         r = results[qp]
@@ -439,7 +470,7 @@ def evaluate_vcm_performance(args):
         psnr = r.get('avg_psnr_all', 0)
         bpp_i = r.get('avg_bpp_i', 0)
         bpp_p = r.get('avg_bpp_p', 0)
-        print(f"  {qp:>4} │ {bpp_all:>10.4f} │ {fmse:>12.6f} │ {psnr:>9.2f} dB │ "
+        print(f"  {qp:>4} │ {bpp_all:>10.4f} │ {fmse:>13.4f} │ {psnr:>9.2f} dB │ "
               f"{bpp_i:>9.4f} │ {bpp_p:>9.4f}")
 
     print(f"{'='*80}\n")
@@ -466,17 +497,16 @@ def evaluate_vcm_performance(args):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
         fig.suptitle('VCM Rate-Distortion Curves', fontsize=14, fontweight='bold')
 
-        # BPP vs Feature MSE (lower is better for both)
+        # BPP vs Accuracy (higher is better)
         ax1.plot(bpps, fmses, 'bo-', label='VCM Model', markersize=8, linewidth=2)
         for i, qp in enumerate(qps):
             ax1.annotate(f'QP={qp}', (bpps[i], fmses[i]),
                          textcoords="offset points", xytext=(5, 5), fontsize=8)
         ax1.set_xlabel('BPP (Bits Per Pixel)')
-        ax1.set_ylabel('Feature MSE (Task Distortion)')
-        ax1.set_title('BPP vs Feature MSE')
+        ax1.set_ylabel('YOLO Accuracy (F1-score)')
+        ax1.set_title('BPP vs YOLO Accuracy')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        ax1.invert_yaxis()  # Lower MSE = better
 
         # BPP vs PSNR
         ax2.plot(bpps, psnrs, 'ro-', label='VCM Model', markersize=8, linewidth=2)
@@ -539,11 +569,10 @@ def evaluate_bdrate(args):
     print(f"  Anchor: {len(anchor_bpp)} RD points")
     print(f"  Test:   {len(test_bpp)} RD points\n")
 
-    # ── BD-Rate dựa trên Feature MSE (task metric chính) ──
-    # Lưu ý: Feature MSE càng thấp càng tốt, nên đổi dấu để
-    # phù hợp convention BD-Rate (metric cao hơn = tốt hơn)
-    anchor_inv_fmse = [1.0 / max(f, 1e-10) for f in anchor_fmse]
-    test_inv_fmse = [1.0 / max(f, 1e-10) for f in test_fmse]
+    # ── BD-Rate dựa trên YOLO Accuracy (F1-score) ──
+    # Lưu ý: Accuracy càng cao càng tốt, nên không cần nghịch đảo.
+    anchor_inv_fmse = anchor_fmse
+    test_inv_fmse = test_fmse
 
     results = {}
 
@@ -556,11 +585,11 @@ def evaluate_bdrate(args):
             'bd_rate_pct': bd_rate_fmse,
             'bd_metric': bd_metric_fmse,
         }
-        print(f"  BD-Rate (Feature MSE):  {bd_rate_fmse:+.2f}%")
+        print(f"  BD-Rate (YOLO Accuracy):  {bd_rate_fmse:+.2f}%")
         print(f"    → {'Test TIẾT KIỆM bitrate' if bd_rate_fmse < 0 else 'Test TỐN THÊM bitrate'}")
-        print(f"  BD-Metric (1/FMSE):     {bd_metric_fmse:+.4f}")
+        print(f"  BD-Metric (Accuracy):     {bd_metric_fmse:+.4f}")
     except ValueError as e:
-        print(f"  ✗ Không thể tính BD-Rate cho Feature MSE: {e}")
+        print(f"  ✗ Không thể tính BD-Rate cho YOLO Accuracy: {e}")
         results['feature_mse'] = {'error': str(e)}
 
     print()
@@ -597,7 +626,7 @@ def evaluate_bdrate(args):
         else:
             verdict = "✗ VCM model kém hơn anchor"
         print(f"  {verdict}")
-        print(f"  Feature MSE BD-Rate: {bd_r:+.2f}%")
+        print(f"  YOLO Accuracy BD-Rate: {bd_r:+.2f}%")
 
     # ── Plot comparison ──
     try:
@@ -609,14 +638,14 @@ def evaluate_bdrate(args):
         fig.suptitle('BD-Rate Comparison: Anchor vs VCM Model',
                      fontsize=14, fontweight='bold')
 
-        # BPP vs 1/Feature MSE
+        # BPP vs YOLO Accuracy
         ax1.plot(anchor_bpp, anchor_inv_fmse, 'b^-', label='Anchor',
                  markersize=8, linewidth=2)
         ax1.plot(test_bpp, test_inv_fmse, 'ro-', label='VCM Model',
                  markersize=8, linewidth=2)
         ax1.set_xlabel('BPP')
-        ax1.set_ylabel('1 / Feature MSE (higher = better)')
-        ax1.set_title('BPP vs Task Quality')
+        ax1.set_ylabel('YOLO Accuracy (F1-score)')
+        ax1.set_title('BPP vs YOLO Accuracy')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
