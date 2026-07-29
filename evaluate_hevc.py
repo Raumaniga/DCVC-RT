@@ -170,8 +170,10 @@ def evaluate_hevc(args):
                 with torch.no_grad():
                     for t in range(T):
                         # YOLO Accuracy (F1-score)
-                        preds_orig = yolo_model(frames[t].unsqueeze(0)).xyxy[0]
-                        preds_recon = yolo_model(recon_frames[t].unsqueeze(0)).xyxy[0]
+                        img_orig = (frames[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        img_recon = (recon_frames[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        preds_orig = yolo_model([img_orig]).xyxy[0]
+                        preds_recon = yolo_model([img_recon]).xyxy[0]
                         acc = compute_yolo_accuracy(preds_orig, preds_recon)
                         seq_fmse.append(acc)
                         

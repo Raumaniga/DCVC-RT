@@ -410,8 +410,10 @@ def evaluate_vcm_performance(args):
                 x_hat_0, rate_bpp_0 = dmci.forward_train(x_0, qp)
 
                 # YOLO Accuracy (F1-score)
-                preds_orig_0 = yolo_model(x_0).xyxy[0]
-                preds_recon_0 = yolo_model(x_hat_0).xyxy[0]
+                img_orig_0 = (x_0.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                img_recon_0 = (x_hat_0.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                preds_orig_0 = yolo_model([img_orig_0]).xyxy[0]
+                preds_recon_0 = yolo_model([img_recon_0]).xyxy[0]
                 acc_0 = compute_yolo_accuracy(preds_orig_0, preds_recon_0)
                 # Pixel PSNR
                 mse_0 = F.mse_loss(x_hat_0, x_0).item()
@@ -434,8 +436,10 @@ def evaluate_vcm_performance(args):
                         x_t = frames[:, t, :, :, :]
                         x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp)
 
-                        preds_orig_t = yolo_model(x_t).xyxy[0]
-                        preds_recon_t = yolo_model(x_hat_t).xyxy[0]
+                        img_orig_t = (x_t.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        img_recon_t = (x_hat_t.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        preds_orig_t = yolo_model([img_orig_t]).xyxy[0]
+                        preds_recon_t = yolo_model([img_recon_t]).xyxy[0]
                         acc_t = compute_yolo_accuracy(preds_orig_t, preds_recon_t)
 
                         mse_t = F.mse_loss(x_hat_t, x_t).item()
