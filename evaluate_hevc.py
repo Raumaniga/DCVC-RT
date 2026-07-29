@@ -26,8 +26,8 @@ def evaluate_hevc(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    # ── YOLOv5 Full Model for Accuracy (Pseudo-Ground Truth) ──
-    print(f"  Load Full YOLO Model ({args.task_model}) for Accuracy...")
+    # ── YOLOv5 Full Model for mAP (Pseudo-Ground Truth) ──
+    print(f"  Load Full YOLO Model ({args.task_model}) for mAP...")
     try:
         import torchvision
     except ImportError:
@@ -37,35 +37,65 @@ def evaluate_hevc(args):
     yolo_model = torch.hub.load('ultralytics/yolov5', args.task_model, pretrained=True).to(device)
     yolo_model.eval()
 
-    def compute_yolo_accuracy(preds_orig, preds_comp, iou_thresh=0.5, conf_thresh=0.25):
-        p_o = preds_orig[preds_orig[:, 4] > conf_thresh]
-        p_c = preds_comp[preds_comp[:, 4] > conf_thresh]
-        total_orig = len(p_o)
-        total_comp = len(p_c)
-        if total_orig == 0:
-            return (1.0 if total_comp == 0 else 0.0)
-        if total_comp == 0:
-            return 0.0
-        ious = torchvision.ops.box_iou(p_o[:, :4], p_c[:, :4])
-        total_matches = 0
-        matched_c = set()
-        for i in range(len(p_o)):
-            cls_o = p_o[i, 5]
-            best_iou = 0
-            best_j = -1
-            for j in range(len(p_c)):
-                if j in matched_c:
-                    continue
-                if p_c[j, 5] == cls_o and ious[i, j] > iou_thresh:
-                    if ious[i, j] > best_iou:
-                        best_iou = ious[i, j]
-                        best_j = j
-            if best_j != -1:
-                matched_c.add(best_j)
-                total_matches += 1
-        precision = total_matches / total_comp if total_comp > 0 else 0.0
-        recall = total_matches / total_orig if total_orig > 0 else 0.0
-        return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    def compute_mAP(preds_orig, preds_comp, iou_thresh=0.5, conf_thresh=0.25):
+        """Compute mAP@0.5 using pseudo-ground-truth (original image detections)."""
+        gt_boxes = preds_orig[preds_orig[:, 4] > conf_thresh]
+        pred_boxes = preds_comp
+
+        if len(gt_boxes) == 0:
+            return 1.0 if len(pred_boxes[pred_boxes[:, 4] > conf_thresh]) == 0 else 0.0
+
+        gt_classes = gt_boxes[:, 5].unique()
+        if len(gt_classes) == 0:
+            return 1.0
+
+        aps = []
+        for cls in gt_classes:
+            gt_cls = gt_boxes[gt_boxes[:, 5] == cls]
+            pred_cls = pred_boxes[pred_boxes[:, 5] == cls]
+
+            if len(pred_cls) == 0:
+                aps.append(0.0)
+                continue
+
+            sorted_idx = pred_cls[:, 4].argsort(descending=True)
+            pred_cls = pred_cls[sorted_idx]
+
+            ious = torchvision.ops.box_iou(pred_cls[:, :4], gt_cls[:, :4])
+            n_gt = len(gt_cls)
+            tp = torch.zeros(len(pred_cls))
+            fp = torch.zeros(len(pred_cls))
+            matched_gt = set()
+
+            for i in range(len(pred_cls)):
+                max_iou, max_j = 0, -1
+                for j in range(n_gt):
+                    if j in matched_gt:
+                        continue
+                    if ious[i, j] > max_iou:
+                        max_iou = ious[i, j].item()
+                        max_j = j
+                if max_iou >= iou_thresh and max_j != -1:
+                    tp[i] = 1
+                    matched_gt.add(max_j)
+                else:
+                    fp[i] = 1
+
+            tp_cum = tp.cumsum(0)
+            fp_cum = fp.cumsum(0)
+            recall = tp_cum / n_gt
+            precision = tp_cum / (tp_cum + fp_cum)
+
+            recall = torch.cat([torch.tensor([0.0]), recall, torch.tensor([1.0])])
+            precision = torch.cat([torch.tensor([1.0]), precision, torch.tensor([0.0])])
+            for i in range(len(precision) - 2, -1, -1):
+                precision[i] = max(precision[i], precision[i + 1])
+            ap = 0.0
+            for i in range(1, len(recall)):
+                ap += (recall[i] - recall[i - 1]).item() * precision[i].item()
+            aps.append(ap)
+
+        return sum(aps) / len(aps) if aps else 0.0
 
     # ── Dataset ──
     # Dùng chung Dataset loader với VCM để đảm bảo crop và chọn frame giống hệt nhau
@@ -169,12 +199,12 @@ def evaluate_hevc(args):
                 
                 with torch.no_grad():
                     for t in range(T):
-                        # YOLO Accuracy (F1-score)
+                        # YOLO mAP@0.5
                         img_orig = (frames[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                         img_recon = (recon_frames[t].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
                         preds_orig = yolo_model([img_orig]).xyxy[0]
                         preds_recon = yolo_model([img_recon]).xyxy[0]
-                        acc = compute_yolo_accuracy(preds_orig, preds_recon)
+                        acc = compute_mAP(preds_orig, preds_recon)
                         seq_fmse.append(acc)
                         
                         # Pixel PSNR
@@ -205,15 +235,15 @@ def evaluate_hevc(args):
     print(f"\n{'='*60}")
     print(f"  HEVC Performance Results")
     print(f"{'='*60}")
-    print(f"  {'CRF':>4} │ {'BPP (all)':>10} │ {'Accuracy (F1)':>13} │ {'Pixel PSNR':>11}")
-    print(f"  {'─'*4}─┼─{'─'*10}─┼─{'─'*13}─┼─{'─'*11}")
+    print(f"  {'CRF':>4} │ {'BPP (all)':>10} │ {'mAP@0.5':>10} │ {'Pixel PSNR':>11}")
+    print(f"  {'─'*4}─┼─{'─'*10}─┼─{'─'*10}─┼─{'─'*11}")
 
     for crf in sorted(results.keys()):
         r = results[crf]
         bpp_all = r.get('avg_bpp_all', 0)
         fmse = r.get('avg_feature_mse_all', 0)
         psnr = r.get('avg_psnr_all', 0)
-        print(f"  {crf:>4} │ {bpp_all:>10.4f} │ {fmse:>13.4f} │ {psnr:>9.2f} dB")
+        print(f"  {crf:>4} │ {bpp_all:>10.4f} │ {fmse:>10.4f} │ {psnr:>9.2f} dB")
     print(f"{'='*60}\n")
 
     # ── Save Results ──
