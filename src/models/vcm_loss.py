@@ -55,8 +55,8 @@ class VCMLoss(nn.Module):
         # 3. Dynamic Lambda Mapping (Gắn nhịp đập Loss với QP)
         if qp is not None:
             import math
-            lambda_max = 2048.0
-            lambda_min = 16.0
+            lambda_max = 768.0   # Khớp bài báo DCVC-RT: "interpolated between 1 and 768"
+            lambda_min = 1.0
             safe_qp = max(0.0, min(63.0, float(qp)))
             ratio = safe_qp / 63.0
             current_lambda = lambda_max * math.pow(lambda_min / lambda_max, ratio)

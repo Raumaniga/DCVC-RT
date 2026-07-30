@@ -694,14 +694,21 @@ def train_stage2(args):
 
             frames = frames.to(device)
             T = frames.size(1)
-            qp = random.randint(0, 63)
+            base_qp = random.randint(0, 63)
+
+            # Hierarchical QP Offset (bài báo DCVC-RT: [0,8,0,4,0,4,0,4])
+            # Cho 5 frame: [0, 4, 0, 4, 0]
+            QP_OFFSETS_8 = [0, 8, 0, 4, 0, 4, 0, 4]
+            QP_OFFSETS_5 = [0, 4, 0, 4, 0]
+            qp_offsets = QP_OFFSETS_5 if T <= 5 else QP_OFFSETS_8
 
             optimizer.zero_grad()
 
             # ── Frame 0: I-frame (DMCI, frozen) ──
             x_0 = frames[:, 0, :, :, :]
+            qp_0 = min(base_qp + qp_offsets[0], 63)
             with torch.no_grad():
-                x_hat_0, _ = dmci.forward_train(x_0, qp)
+                x_hat_0, _ = dmci.forward_train(x_0, qp_0)
 
             dmc.clear_dpb()
             dmc.set_curr_poc(0)
@@ -716,8 +723,9 @@ def train_stage2(args):
 
             for t in range(1, T):
                 x_t = frames[:, t, :, :, :]
-                x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp)
-                details = criterion(x_t, x_hat_t, rate_bpp_t, qp=qp, return_details=True)
+                qp_t = min(base_qp + qp_offsets[t % len(qp_offsets)], 63)
+                x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp_t)
+                details = criterion(x_t, x_hat_t, rate_bpp_t, qp=qp_t, return_details=True)
 
                 batch_loss = batch_loss + details['total_loss']
                 for k in batch_details:
@@ -931,14 +939,20 @@ def train_stage3(args):
 
             frames = frames.to(device)
             T = frames.size(1)
-            qp = random.randint(0, 63)
+            base_qp = random.randint(0, 63)
+
+            # Hierarchical QP Offset (bài báo DCVC-RT: [0,8,0,4,0,4,0,4])
+            QP_OFFSETS_8 = [0, 8, 0, 4, 0, 4, 0, 4]
+            QP_OFFSETS_5 = [0, 4, 0, 4, 0]
+            qp_offsets = QP_OFFSETS_5 if T <= 5 else QP_OFFSETS_8
 
             optimizer.zero_grad()
 
             # ── Frame 0: I-frame (DMCI, có gradient) ──
             x_0 = frames[:, 0, :, :, :]
-            x_hat_0, rate_bpp_0 = dmci.forward_train(x_0, qp)
-            details_0 = criterion(x_0, x_hat_0, rate_bpp_0, qp=qp, return_details=True)
+            qp_0 = min(base_qp + qp_offsets[0], 63)
+            x_hat_0, rate_bpp_0 = dmci.forward_train(x_0, qp_0)
+            details_0 = criterion(x_0, x_hat_0, rate_bpp_0, qp=qp_0, return_details=True)
 
             dmc.clear_dpb()
             dmc.set_curr_poc(0)
@@ -951,8 +965,9 @@ def train_stage3(args):
             # ── Frame 1..T-1: P-frames (DMC, có gradient) ──
             for t in range(1, T):
                 x_t = frames[:, t, :, :, :]
-                x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp)
-                details_t = criterion(x_t, x_hat_t, rate_bpp_t, qp=qp, return_details=True)
+                qp_t = min(base_qp + qp_offsets[t % len(qp_offsets)], 63)
+                x_hat_t, rate_bpp_t = dmc.forward_train(x_t, qp_t)
+                details_t = criterion(x_t, x_hat_t, rate_bpp_t, qp=qp_t, return_details=True)
 
                 batch_loss = batch_loss + details_t['total_loss']
                 for k in batch_details:
