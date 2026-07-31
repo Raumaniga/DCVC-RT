@@ -335,7 +335,18 @@ def evaluate_vcm_performance(args):
         print("  ⚠️ Không tìm thấy torchvision, hãy cài đặt bằng pip install torchvision")
         return
         
-    yolo_model = torch.hub.load('ultralytics/yolov5', args.task_model, pretrained=True).to(device)
+    # PyTorch 2.6 thay đổi mặc định weights_only=True làm hỏng YOLOv5 v7.0
+    # Ta tạm thời vá lỗi (monkey-patch) hàm torch.load để cho phép load toàn bộ model
+    original_load = torch.load
+    def patched_load(*args, **kwargs):
+        kwargs['weights_only'] = False
+        return original_load(*args, **kwargs)
+    torch.load = patched_load
+
+    yolo_model = torch.hub.load('ultralytics/yolov5:v7.0', args.task_model, pretrained=True).to(device)
+    
+    # Trả lại hàm torch.load như cũ
+    torch.load = original_load
     yolo_model.eval()
 
     def compute_mAP(preds_orig, preds_comp, iou_thresh=0.5, conf_thresh=0.25):
