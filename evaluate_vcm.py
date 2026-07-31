@@ -664,7 +664,7 @@ def evaluate_bdrate(args):
         else:
             verdict = "✗ VCM model kém hơn anchor"
         print(f"  {verdict}")
-        print(f"  mAP BD-Rate: {bd_r:+.2f}%"))
+        print(f"  mAP BD-Rate: {bd_r:+.2f}%")
 
     # ── Plot comparison ──
     try:

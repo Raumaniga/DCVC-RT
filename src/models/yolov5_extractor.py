@@ -12,8 +12,19 @@ class YOLOv5FeatureExtractor(nn.Module):
             + True = F_trainable (được phép học, dùng cho ảnh giải nén).
         """
         super().__init__()
+        # PyTorch 2.6 thay đổi mặc định weights_only=True làm hỏng YOLOv5 v7.0
+        # Ta tạm thời vá lỗi (monkey-patch) hàm torch.load để cho phép load toàn bộ model
+        original_load = torch.load
+        def patched_load(*args, **kwargs):
+            kwargs['weights_only'] = False
+            return original_load(*args, **kwargs)
+        torch.load = patched_load
+
         # Tự động tải YOLOv5 từ PyTorch Hub (dùng bản v7.0 để tránh lỗi tương thích với thư viện ultralytics mới)
         yolo = torch.hub.load('ultralytics/yolov5:v7.0', model_name, pretrained=True, trust_repo=True)
+        
+        # Trả lại hàm torch.load như cũ
+        torch.load = original_load
         
         # Cắt lấy các layer đầu tiên làm "front-end"
         layers = list(yolo.model.model.model.children())[:extract_layer_idx + 1]
