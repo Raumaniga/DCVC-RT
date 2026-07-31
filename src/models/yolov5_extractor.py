@@ -12,8 +12,8 @@ class YOLOv5FeatureExtractor(nn.Module):
             + True = F_trainable (được phép học, dùng cho ảnh giải nén).
         """
         super().__init__()
-        # Tự động tải YOLOv5 từ PyTorch Hub (yêu cầu kết nối mạng lần đầu)
-        yolo = torch.hub.load('ultralytics/yolov5', model_name, pretrained=True, trust_repo=True)
+        # Tự động tải YOLOv5 từ PyTorch Hub (dùng bản v7.0 để tránh lỗi tương thích với thư viện ultralytics mới)
+        yolo = torch.hub.load('ultralytics/yolov5:v7.0', model_name, pretrained=True, trust_repo=True)
         
         # Cắt lấy các layer đầu tiên làm "front-end"
         layers = list(yolo.model.model.model.children())[:extract_layer_idx + 1]
