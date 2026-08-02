@@ -38,7 +38,7 @@ class YOLOv5FeatureExtractor(nn.Module):
                 
     def forward(self, x):
         # Đầu vào x là Tensor ảnh RGB, giá trị [0, 1]
-        if not self.trainable:
-            with torch.no_grad():
-                return self.feature_extractor(x)
+        # Không dùng torch.no_grad ở đây để cho phép gradient chảy qua mạng YOLO
+        # truyền ngược về cho x (ảnh giải nén) giúp cập nhật DCVC-RT.
+        # Các layer của YOLO đã được set requires_grad=False ở trên nên sẽ không bị update.
         return self.feature_extractor(x)

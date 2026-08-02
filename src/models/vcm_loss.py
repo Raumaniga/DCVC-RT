@@ -37,8 +37,9 @@ class VCMLoss(nn.Module):
         - return_details: Nếu True, trả về dict chứa tất cả thông tin chi tiết cho logging.
         """
         # 1. Trích xuất đặc trưng (Features)
-        # r_t: Feature chuẩn (Ground truth feature)
-        r_t = self.front_end_original(x_uncompressed)
+        # r_t: Feature chuẩn (Ground truth feature). Tính bằng no_grad để tiết kiệm VRAM
+        with torch.no_grad():
+            r_t = self.front_end_original(x_uncompressed)
         
         # r_hat_t: Feature tái tạo từ ảnh bị nén (Cũng dùng chung Giám khảo Thép)
         r_hat_t = self.front_end_original(x_reconstructed)
