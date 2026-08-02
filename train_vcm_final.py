@@ -414,9 +414,8 @@ def train_stage1(args):
     ).to(device)
 
     # ── Optimizer ──
-    # Train cả DMCI + Trainable Front End (theo sơ đồ: gradient chạy qua cả hai)
-    trainable_params = list(model.parameters()) + \
-                       list(criterion.front_end_trainable.parameters())
+    # Train DMCI (Front-end YOLO đã được đóng băng hoàn toàn trong VCMLoss)
+    trainable_params = list(model.parameters())
     optimizer = optim.Adam(trainable_params, lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -440,8 +439,6 @@ def train_stage1(args):
         # Lấy lại weights
         if 'model_state_dict' in ckpt_data:
             model.load_state_dict(ckpt_data['model_state_dict'])
-        if 'front_end_trainable_state_dict' in ckpt_data:
-            criterion.front_end_trainable.load_state_dict(ckpt_data['front_end_trainable_state_dict'])
             
         # Lấy lại optimizer và tính toán epoch
         if 'optimizer_state_dict' in ckpt_data:
@@ -533,7 +530,6 @@ def train_stage1(args):
         ckpt = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
-            'front_end_trainable_state_dict': criterion.front_end_trainable.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
@@ -629,17 +625,10 @@ def train_stage2(args):
         extract_layer_idx=args.extract_layer_idx,
     ).to(device)
 
-    # Load trainable front end từ Stage 1 nếu có
-    if isinstance(dmci_ckpt_data, dict) and 'front_end_trainable_state_dict' in dmci_ckpt_data:
-        criterion.front_end_trainable.load_state_dict(
-            dmci_ckpt_data['front_end_trainable_state_dict']
-        )
-        print(f"  ✓ Loaded Trainable Front End from DMCI checkpoint")
-        print(f"  ✓ Loaded Trainable Front End from DMCI checkpoint")
 
-    # ── Optimizer: DMC + Trainable Front End ──
-    trainable_params = list(dmc.parameters()) + \
-                       list(criterion.front_end_trainable.parameters())
+
+    # ── Optimizer: DMC (Front-end YOLO đóng băng) ──
+    trainable_params = list(dmc.parameters())
     optimizer = optim.Adam(trainable_params, lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -663,8 +652,6 @@ def train_stage2(args):
         # Lấy lại weights
         if 'model_state_dict' in ckpt_data:
             dmc.load_state_dict(ckpt_data['model_state_dict'])
-        if 'front_end_trainable_state_dict' in ckpt_data:
-            criterion.front_end_trainable.load_state_dict(ckpt_data['front_end_trainable_state_dict'])
             
         # Lấy lại optimizer và tính toán epoch
         if 'optimizer_state_dict' in ckpt_data:
@@ -782,7 +769,6 @@ def train_stage2(args):
         ckpt = {
             'epoch': epoch,
             'model_state_dict': dmc.state_dict(),
-            'front_end_trainable_state_dict': criterion.front_end_trainable.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
@@ -862,25 +848,11 @@ def train_stage3(args):
         extract_layer_idx=args.extract_layer_idx,
     ).to(device)
 
-    # Load trainable front end nếu có
-    for ckpt_candidate in [
-        ckpt_p if args.dmc_ckpt else None,
-        ckpt_i if args.dmci_ckpt else None,
-    ]:
-        if (ckpt_candidate is not None and isinstance(ckpt_candidate, dict)
-                and 'front_end_trainable_state_dict' in ckpt_candidate):
-            criterion.front_end_trainable.load_state_dict(
-                ckpt_candidate['front_end_trainable_state_dict']
-            )
-            print(f"  ✓ Loaded Trainable Front End from checkpoint")
-            break
-
-    # ── Optimizer (learning rate thấp hơn cho fine-tuning) ──
-    joint_lr = args.lr * 0.1
+    # ── Optimizer (Learning rate cao hơn để ép mô hình học VCM nhanh trong 20 Epoch) ──
+    joint_lr = args.lr
     trainable_params = (
         list(dmci.parameters()) +
-        list(dmc.parameters()) +
-        list(criterion.front_end_trainable.parameters())
+        list(dmc.parameters())
     )
     optimizer = optim.Adam(trainable_params, lr=joint_lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -907,8 +879,6 @@ def train_stage3(args):
             dmci.load_state_dict(ckpt_data['dmci_state_dict'])
         if 'dmc_state_dict' in ckpt_data:
             dmc.load_state_dict(ckpt_data['dmc_state_dict'])
-        if 'front_end_trainable_state_dict' in ckpt_data:
-            criterion.front_end_trainable.load_state_dict(ckpt_data['front_end_trainable_state_dict'])
             
         # Lấy lại optimizer và tính toán epoch
         if 'optimizer_state_dict' in ckpt_data:
@@ -1024,7 +994,6 @@ def train_stage3(args):
             'epoch': epoch,
             'dmci_state_dict': dmci.state_dict(),
             'dmc_state_dict': dmc.state_dict(),
-            'front_end_trainable_state_dict': criterion.front_end_trainable.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
