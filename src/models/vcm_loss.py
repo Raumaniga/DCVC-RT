@@ -17,13 +17,7 @@ class VCMLoss(nn.Module):
             extract_layer_idx=extract_layer_idx, 
             trainable=False
         )
-        
-        # F_trainable: Cho phép học, trích đặc trưng từ video đã nén
-        self.front_end_trainable = YOLOv5FeatureExtractor(
-            model_name=model_name, 
-            extract_layer_idx=extract_layer_idx, 
-            trainable=True
-        )
+
         
         self.mse_loss = nn.MSELoss()
 
@@ -46,8 +40,8 @@ class VCMLoss(nn.Module):
         # r_t: Feature chuẩn (Ground truth feature)
         r_t = self.front_end_original(x_uncompressed)
         
-        # r_hat_t: Feature tái tạo từ ảnh bị nén
-        r_hat_t = self.front_end_trainable(x_reconstructed)
+        # r_hat_t: Feature tái tạo từ ảnh bị nén (Cũng dùng chung Giám khảo Thép)
+        r_hat_t = self.front_end_original(x_reconstructed)
         
         # 2. Tính Distortion (Mức độ méo mó của Feature thay vì Pixel)
         feature_mse = self.mse_loss(r_hat_t, r_t)
