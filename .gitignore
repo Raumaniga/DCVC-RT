@@ -14,8 +14,10 @@ output/
 out_bin/
 temp_dcvc/
 dcvc_rt_training/
+DCVC/
 *.zip
 *.pdf
+*.docx
 *.pth
 *.pth.tar
 logs/

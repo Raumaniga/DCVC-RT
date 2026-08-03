@@ -1,0 +1,16 @@
+{
+  "sequences": [
+    {
+      "name": "Kimono",
+      "frames_dir": "frames/Kimono",
+      "labels_dir": "labels/Kimono",
+      "fps": 24
+    },
+    {
+      "name": "Cactus",
+      "frames_dir": "frames/Cactus",
+      "labels_dir": "labels/Cactus",
+      "fps": 50
+    }
+  ]
+}

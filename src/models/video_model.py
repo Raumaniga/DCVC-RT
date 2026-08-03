@@ -291,20 +291,18 @@ class DMC(CompressionModel):
         return x_hat, feature
 
     def forward_train(self, x, qp):
-        """
-        [TRAINING MODE] Tính toán luồng forward cho P-frame để tính BPP và tái tạo ảnh.
-        Bỏ qua khâu nén ra byte (C++) để giữ lại Gradient cho Backpropagation.
+        """Differentiable P-frame path used only during model training.
 
-        Yêu cầu: dpb phải có ít nhất 1 reference frame trước khi gọi hàm này.
-        Sau khi chạy xong, reference frame mới sẽ được tự động lưu vào dpb.
+        This path estimates entropy rate instead of writing bytes, preserving
+        the computation graph required by Feature-MSE backpropagation.
+        ``dpb`` must already contain an external reference seed.
 
         Args:
-            x: Input frame [B, 3, H, W], range [0, 1]
-            qp: Quantization parameter index (0-71)
+            x: Input frame ``[B, 3, H, W]`` in ``[0, 1]``.
+            qp: Quantization index in ``[0, 71]``.
 
         Returns:
-            x_hat: Ảnh tái tạo [B, 3, H, W], range [0, 1]
-            rate_bpp: Số bit trên mỗi điểm ảnh (scalar tensor, có gradient)
+            Reconstructed frame and differentiable estimated BPP.
         """
         q_encoder = self.q_encoder[qp:qp+1, :, :, :]
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]
@@ -364,6 +362,11 @@ class DMC(CompressionModel):
             self.reset_ref_feature()
 
     def compress(self, x, qp):
+        """Entropy-code one P-frame for evaluation/deployment.
+
+        This discrete path returns actual bytes and is intentionally not used
+        for gradient-based training. Use :meth:`forward_train` while training.
+        """
         # pic_width and pic_height may be different from x's size. x here is after padding
         # x_hat has the same size with x
         device = x.device
@@ -408,6 +411,7 @@ class DMC(CompressionModel):
         }
 
     def decompress(self, bit_stream, sps, qp):
+        """Decode one entropy-coded P-frame for evaluation/deployment."""
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
         q_decoder = self.q_decoder[qp:qp+1, :, :, :]

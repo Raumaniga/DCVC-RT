@@ -1,77 +1,120 @@
+"""Machine-only rate-distortion objective for DCVC-RT."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 import torch
-import torch.nn as nn
-from .yolov5_extractor import YOLOv5FeatureExtractor
+from torch import nn
+from torch.nn import functional as F
+
+from .yolov5_extractor import DEFAULT_FEATURE_LAYER_INDICES, YOLOv5FeatureExtractor
+
 
 class VCMLoss(nn.Module):
-    def __init__(self, lambda_base=256, model_name='yolov5s', extract_layer_idx=4):
-        """
-        Hàm Loss Tùy chỉnh (Phương trình 17 trong bài báo "Learned Scalable Video Coding...")
-        L_base = R_base + lambda * MSE(r_t, r_hat_t)
-        """
+    """Rate plus YOLO task-feature distortion.
+
+    The teacher extracts target features from the uncompressed frame under
+    ``no_grad``. The reconstruction extractor is also frozen, but its input
+    path remains differentiable so its Feature-MSE updates only the DMC video
+    codec. Neither YOLO extractor is part of the optimizer.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "yolov5s",
+        feature_layer_indices: Sequence[int] = DEFAULT_FEATURE_LAYER_INDICES,
+        feature_layer_weights: Sequence[float] | None = None,
+    ):
         super().__init__()
-        self.lambda_base = lambda_base
-        
-        # F_original: Đóng băng, trích đặc trưng từ video gốc chưa nén
-        self.front_end_original = YOLOv5FeatureExtractor(
-            model_name=model_name, 
-            extract_layer_idx=extract_layer_idx, 
-            trainable=False
+        self.feature_layer_indices = tuple(int(index) for index in feature_layer_indices)
+        if feature_layer_weights is None:
+            feature_layer_weights = (1.0,) * len(self.feature_layer_indices)
+        weights = tuple(float(weight) for weight in feature_layer_weights)
+        if len(weights) != len(self.feature_layer_indices):
+            raise ValueError(
+                "feature_layer_weights and feature_layer_indices must have the same length"
+            )
+        if any(weight <= 0 for weight in weights):
+            raise ValueError("all feature layer weights must be positive")
+        weight_tensor = torch.tensor(weights, dtype=torch.float32)
+        self.register_buffer("layer_weights", weight_tensor / weight_tensor.sum())
+        self.layer_metric_names = tuple(
+            f"feature_mse_l{index}" for index in self.feature_layer_indices
         )
 
-        
-        self.mse_loss = nn.MSELoss()
+        self.teacher_extractor = YOLOv5FeatureExtractor(
+            model_name,
+            self.feature_layer_indices,
+        )
+        self.reconstruction_extractor = YOLOv5FeatureExtractor(
+            model_name,
+            self.feature_layer_indices,
+        )
 
-    def train(self, mode=True):
-        """Override train() to ensure F_original always stays in eval mode."""
+    def train(self, mode: bool = True):
         super().train(mode)
-        self.front_end_original.eval()
+        self.teacher_extractor.eval()
+        self.reconstruction_extractor.eval()
         return self
 
-    def forward(self, x_uncompressed, x_reconstructed, rate_bpp, qp=None, return_details=False):
-        """
-        Đầu vào:
-        - x_uncompressed: Ảnh RGB gốc (Shape: [Batch, 3, H, W], Range: [0, 1])
-        - x_reconstructed: Ảnh RGB giải nén từ DCVC-RT (Base Frame)
-        - rate_bpp: Số bit sinh ra trên mỗi pixel (bpp) được ước tính từ Entropy Model.
-        - qp: Quantization parameter index (0-63)
-        - return_details: Nếu True, trả về dict chứa tất cả thông tin chi tiết cho logging.
-        """
-        # 1. Trích xuất đặc trưng (Features)
-        # r_t: Feature chuẩn (Ground truth feature). Tính bằng no_grad để tiết kiệm VRAM
+    def forward(
+        self,
+        original: torch.Tensor,
+        reconstructed: torch.Tensor,
+        estimated_bpp: torch.Tensor,
+        lambda_rd: float,
+        distortion_weight: float = 1.0,
+        return_details: bool = False,
+    ):
+        if lambda_rd <= 0:
+            raise ValueError("lambda_rd must be positive")
+        if distortion_weight <= 0:
+            raise ValueError("distortion_weight must be positive")
+
         with torch.no_grad():
-            r_t = self.front_end_original(x_uncompressed)
-        
-        # r_hat_t: Feature tái tạo từ ảnh bị nén (Cũng dùng chung Giám khảo Thép)
-        r_hat_t = self.front_end_original(x_reconstructed)
-        
-        # 2. Tính Distortion (Mức độ méo mó của Feature thay vì Pixel)
-        feature_mse = self.mse_loss(r_hat_t, r_t)
-        
-        # 3. Dynamic Lambda Mapping (Gắn nhịp đập Loss với QP)
-        if qp is not None:
-            import math
-            lambda_max = 768.0   # Khớp bài báo DCVC-RT: "interpolated between 1 and 768"
-            lambda_min = 1.0
-            safe_qp = max(0.0, min(63.0, float(qp)))
-            ratio = safe_qp / 63.0
-            current_lambda = lambda_max * math.pow(lambda_min / lambda_max, ratio)
-        else:
-            current_lambda = self.lambda_base
-            
-        distortion_weighted = current_lambda * feature_mse
-        total_loss = rate_bpp + distortion_weighted
-        
-        if return_details:
-            # Tính thêm pixel-level PSNR để giám sát (không ảnh hưởng gradient)
-            with torch.no_grad():
-                pixel_mse = nn.functional.mse_loss(x_reconstructed, x_uncompressed)
-                psnr = 10 * torch.log10(1.0 / pixel_mse.clamp(min=1e-10))
-            return {
-                'total_loss': total_loss,
-                'rate_bpp': rate_bpp,
-                'feature_mse': feature_mse,
-                'distortion_weighted': distortion_weighted,
-                'pixel_psnr': psnr,
+            teacher_features = self.teacher_extractor(original)
+        reconstructed_features = self.reconstruction_extractor(reconstructed)
+        if len(teacher_features) != len(reconstructed_features):
+            raise RuntimeError("teacher and reconstruction feature pyramids do not match")
+
+        layer_losses = torch.stack(
+            [
+                F.mse_loss(reconstructed_feature, teacher_feature)
+                for reconstructed_feature, teacher_feature in zip(
+                    reconstructed_features,
+                    teacher_features,
+                    strict=True,
+                )
+            ]
+        )
+        feature_mse = torch.sum(
+            layer_losses * self.layer_weights.to(dtype=layer_losses.dtype)
+        )
+        weighted_feature_mse = (
+            float(lambda_rd) * float(distortion_weight) * feature_mse
+        )
+        total_loss = estimated_bpp + weighted_feature_mse
+
+        if not return_details:
+            return total_loss
+
+        details = {
+            "total_loss": total_loss,
+            "estimated_bpp": estimated_bpp,
+            "feature_mse": feature_mse,
+            "weighted_feature_mse": weighted_feature_mse,
+            "lambda_rd": total_loss.new_tensor(float(lambda_rd)),
+            "distortion_weight": total_loss.new_tensor(float(distortion_weight)),
+        }
+        details.update(
+            {
+                metric_name: layer_loss
+                for metric_name, layer_loss in zip(
+                    self.layer_metric_names,
+                    layer_losses,
+                    strict=True,
+                )
             }
-        
-        return total_loss, feature_mse
+        )
+        return details
