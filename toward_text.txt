@@ -1,0 +1,1788 @@
+Towards Practical Real-Time Neural Video Compression
+Zhaoyang Jia1* Bin Li2
+Jiahao Li2
+Wenxuan Xie2
+Linfeng Qi1∗
+Houqiang Li1
+Yan Lu2
+1 University of Science and Technology of China
+2 Microsoft Research Asia
+{jzy ustc, qlf324}@mail.ustc.edu.cn, lihq@ustc.edu.cn
+{libin, li.jiahao, wenxie, yanlu}@microsoft.com
+Abstract
+We introduce a practical real-time neural video codec
+(NVC) designed to deliver high compression ratio, low la-
+tency and broad versatility. In practice, the coding speed
+of NVCs depends on 1) computational costs, and 2) non-
+computational operational costs, such as memory I/O and
+the number of function calls. While most efficient NVCs
+prioritize reducing computational cost, we identify opera-
+tional cost as the primary bottleneck to achieving higher
+coding speed. Leveraging this insight, we introduce a set
+of efficiency-driven design improvements focused on mini-
+mizing operational costs. Specifically, we employ implicit
+temporal modeling to eliminate complex explicit motion mod-
+ules, and use single low-resolution latent representations
+rather than progressive downsampling. These innovations
+significantly accelerate NVC without sacrificing compression
+quality. Additionally, we implement model integerization for
+consistent cross-device coding and a module-bank-based
+rate control scheme to improve practical adaptability. Exper-
+iments show our proposed DCVC-RT achieves an impressive
+average encoding/decoding speed at 125.2/112.8 fps (frames
+per second) for 1080p video, while saving an average of 21%
+in bitrate compared to H.266/VTM. The code is available at
+https://github.com/microsoft/DCVC.
+1. Introduction
+Neural video codecs (NVCs) have exhibited significant po-
+tential in reducing redundancy within video data to achieve
+higher compression ratios. Since the early work DVC [33],
+substantial advances [6, 16, 18–20, 22, 28, 30, 34, 35, 42, 45,
+48, 54] have been made in enhancing the rate-distortion per-
+formance of NVCs. Recent NVCs have surpassed traditional
+codecs like H.265/HM [2], H.266/VTM [3], and ECM [1].
+In this context, compression ratio is no longer the primary
+*This work was done when Zhaoyang Jia and Linfeng Qi were full-time
+interns at Microsoft Research Asia.
+†This paper is the outcome of an open-source project started from Dec.
+2023.
+ELF-VC
+MobileNVC
+VTM-17.0
+1080p Coding Speed / FPS ↑
+Device
+Enc.
+Dec.
+-62.0%
+50.8%
+-26.1%
+Snapdragon 
+8 Gen 2
+Titan V
+0.01
+23.6
+3
+38.9
+10
+18
+BD-Rate 
+against x265 
+on UVG ↓
+Cross
+Device
+Rate
+Control
+DCVC-RT
+DCVC-FM
+DHVC-2.0
+C3
+-29.0%
+-56.9%
+-69.8%
+-70.9%
+A100
+RTX 3090
+A100
+15.6
+4.3
+7.1
+5.0
+5.9
+RTX 4090
+119
+105
+RTX 2080Ti
+40
+34
+AMD EPYC
+7V13 Processor
+0.0004
+Video 
+Codecs
+-7.9%
+RTX 4090
+418
+502
+Traditional Codecs
+Neural Codecs
+A100
+125
+113
+ECM-11.0
+-69.4%
+0.002
+3.4
+AMD EPYC
+7V13 Processor
+NVEnc-HEVC
+Figure 1. Towards practical real-time neural video codecs (NVCs).
+Recent advanced NVCs have demonstrated either excellent rate-
+distortion performance, or improved versatility like integrated cross-
+device coding consistency or rate-control capabilities. In this paper,
+we further address the core obstacles of achieving real-time coding
+to close the last mile toward a practical NVC solution. Our DCVC-
+RT not only achieves state-of-the-art compression ratio but is also
+deployable on consumer devices for real-time video coding.
+bottleneck for NVCs. Instead, the key challenge now lies
+in how to make NVCs more practical and deployable for
+real-world applications, to effectively utilize the advantages
+of such compression ratios.
+In response, recent efforts have concentrated on enhanc-
+1
+arXiv:2502.20762v2  [eess.IV]  18 Mar 2025
+
+---PAGE BREAK---
+Implicit temporal 
+modelling
+(a) Paradigm of motion-based NVCs
+(b) Proposed practical real-time NVC
+𝑥𝑡
+Motion
+Estimation
+Motion
+𝑥𝑡, ො𝑥𝑡−1
+𝑥𝑡
+Motion 
+Compensation
+Feature
+Extractor
+Enc.
+Dec.
+Enc.
+Dec.
+Enc.
+Dec.
+Feature 
+Extractor
+𝑓𝑡 , ො𝑥𝑡
+Efficiency-Driven Designs
+Latent representation 
+at single low resolution
+Towards Practical Real-Time NVC 
+Integerization for
+cross-device sync.
+Practical Techniques
+Module-bank-based
+rate-control
+𝑓𝑡−1
+𝑓𝑡 , ො𝑥𝑡
+𝑓𝑡−1
+Figure 2. Paradigm shift. To enhance efficiency, we eliminate explicit motion-related modules and adopt implicit temporal modeling.
+We also propose learning latent representations at a single low resolution, replacing the traditional progressive downsampling approach.
+Additionally, DCVC-RT supports integerization for cross-device consistency and incorporates a module-bank-based rate-control mechanism.
+ing the functionality and versatility of NVCs. Tian et al. [47]
+introduced auxiliary calibration bitstream transmission to
+improve cross-device coding accuracy, while MobileCodec
+[24] and MobileNVC [49] employ deterministic integer cal-
+culations to ensure consistent output across different devices.
+For rate-control functionality, methods like ELF-VC [43],
+DCVC-FM [28], and DHVC [35, 36] offer controllable rate
+adjustment within a single model. Zhang et al. [57] devel-
+oped a rate allocation network for precise bitrate control.
+These innovations have significantly improved the practical-
+ity of NVCs, bringing them closer to real-world deployment.
+Despite these advancements, a critical challenge persists
+for practical NVCs: how to effectively accelerate NVCs for
+real-time coding? Actually, current NVCs struggle to bal-
+ance coding speed with rate-distortion performance, leading
+to a suboptimal rate-distortion-complexity trade-off. For
+instance, while MobileNVC [49] achieves real-time decod-
+ing on consumer hardware, its compression ratio is even
+lower than x264 [4]. C3 [22] provides efficient decoding
+but relies on time-consuming optimization-based encoding.
+DHVC-2.0 [35] requires pipelining across multiple GPUs
+(e.g., 4) to achieve real-time decoding, but its efficiency
+drops significantly in typical single-GPU environments. Al-
+though these methods have significantly accelerated NVCs,
+real-time coding of 1080p video with high compression ra-
+tios on consumer devices remains elusive.
+In this paper, we aim to address the core obstacles of
+achieving real-time coding to close the last mile toward a
+practical NVC solution. To accelerate NVCs, our first step
+is to rethink the complexity problem. While most existing
+research focuses on reducing computational complexity,
+typically measured by the number of multiply-accumulate
+operations (MACs) during model inference, this alone does
+not determine the actual coding speed. In practice, many
+other operations like communication between hardware com-
+ponents, also significantly impact performance. For instance,
+auto-regressive entropy models [22, 25, 39] require frequent
+function calls, which incur significant time overhead despite
+low overall computational cost. Additionally, memory I/O
+costs of tensors increase with larger tensor sizes, even at
+the same computational load. We define these factors as the
+operational complexity. Surprisingly, our findings show
+that high operational overhead, rather than computational
+cost, is the primary bottleneck in accelerating NVCs.
+Based on this insight, we propose a new perspective to
+accelerate NVCs by reducing operational complexity. In this
+process, we preserve model capacity by prioritizing more
+computational capability on the most critical modules while
+eliminating less essential ones. Firstly, we remove complex
+motion estimation and compensation process, significantly
+cutting down the number of components to directly lower the
+operation frequency. The saved computational capacity is
+reallocated to frame coding modules to achieve more effec-
+tive implicit temporal modelling. Additionally, we propose
+learning latent representations at a single low resolution, i.e.,
+1/8 of the original image size. Compared to commonly used
+progressive downsampling method, this approach greatly
+reduces latent-wise memory I/O overhead while facilitating
+more effective latent transformations, leading to improved
+rate-distortion-complexity performance.
+With the aforementioned real-time innovations, we fur-
+ther implement model integerization to ensure cross-device
+consistency and introduce a module-bank-based rate-control
+technique. Together, these advancements culminate in a
+practical real-time NVC, DCVC-RT. As shown in Fig. 1, it
+enables 1080p coding on consumer GPUs like the NVIDIA
+RTX 2080Ti with an average speed of 40 fps for encoding
+and 34 fps for decoding. On an NVIDIA A100 GPU, it
+2
+
+---PAGE BREAK---
+reaches an impressive 125 fps for encoding and 113 fps for
+decoding. Compared to VTM/H.266, our model provides a
+21.0% bitrate reduction when using the challenging single
+intra-frame setting. Additionally, it matches the compression
+ratio of the advanced DCVC-FM [28] while delivering over
+18 times faster coding speed. To the best of our knowledge,
+DCVC-RT is the first practical NVC to achieve real-time
+coding with a high compression ratio on consumer hardware.
+We summarize the contributions of this paper as follows:
+• We investigate the complexity challenges in NVCs and
+identify operational complexity, rather than computational
+complexity, as the primary bottleneck.
+• Based on this insight, we propose several efficiency-driven
+designs to reduce operational complexity and enable real-
+time NVCs. We further enhance the functionality to intro-
+duce a practical real-time NVC, DCVC-RT.
+• To the best of our knowledge, DCVC-RT is the first real-
+time NVC to achieve high rate-distortion performance,
+enabling 1080p real-time coding on consumer hardware
+with a 21% bitrate reduction compared to VTM/H.266.
+2. Related Works
+Since the introduction of DVC [33], most research on neu-
+ral video codecs (NVCs) has focused on enhancing rate-
+distortion performance. By advancing temporal modeling
+capabilities [6, 7, 29, 40, 41, 44, 45], improving latent dis-
+tribution estimation [18, 26, 27, 30], and refining coding
+paradigms [12, 23, 25, 31, 36, 37], the compression effi-
+ciency of NVCs has seen substantial improvement. Recent
+state-of-the-art NVCs [28, 42] now outperform top tradi-
+tional codecs like ECM [1]. For NVCs, the primary chal-
+lenge has shifted from rate-distortion optimization to enhanc-
+ing functionality and adaptability for real-world deployment.
+Real-Time Coding. While real-time coding has been
+explored in neural image codec [21, 32, 39, 50, 55, 56], it re-
+mains relatively underexplored in neural video codecs. Some
+efforts [43, 47] aim to reduce computational complexity for
+faster coding but still fall short of achieving real-time 1080p
+performance. INR-based methods [16, 19, 22] focuses on
+efficient decoding but requires a time-consuming optimiza-
+tion process for encoding. DHVC-2.0 [35] uses multi-GPU
+pipelines to achieve real-time throughput for decoding, but
+falls short in meeting real-time latency requirements and
+on more common single-GPU devices. MobileNVC [49]
+achieves real-time decoding throughput but only matches the
+compression ratio of x264 [4]. In this paper, we present a
+novel perspective to reduce operational cost rather than com-
+putational cost in NVC. Based on it, we introduce several
+key efficiency-driven techniques to simultaneously achieve
+1080p real-time latency with a compression ratio comparable
+to ECM.
+Practical Functionality. For video codecs, maintaining
+calculation consistency across different devices is a crucial
+functionality. Typically, this inconsistency arises from non-
+deterministic floating-point calculations. Ball´e et al. [10] and
+He et al. [17] introduced model integration into neural image
+codecs to enforce deterministic integer calculations. Simi-
+larly, MobileCodec [24] and MobileNVC [49] implement
+integration in their NVCs to ensure cross-device consistency.
+Recently, Tian et al. [47] proposed eliminating inconsistency
+by introducing auxiliary calibration bitstreams. Another
+important aspect of video codecs is their rate-control capabil-
+ity, particularly in scenarios such as streaming or real-time
+communication. Zhang et al. [57] developed a rate alloca-
+tion network to precisely manage bitrate. Other approaches
+[28, 36, 43] enable continuous, controllable bitrates within
+a single model, adjusting the model to the target bitrate by
+manipulating the quantization parameters (qp). However,
+these methods fail to achieve both cross-device consistency
+and rate-control capability simultaneously. In contrast, we
+introduce a practical NVC that support both capabilities,
+along with real-time coding and a high compression ratio.
+3. Rethink the Complexity Problem in NVCs
+The primary challenge in the practical application of exist-
+ing NVCs is their low coding speed. While recent efforts
+have aimed at reducing computational costs [22, 36, 47],
+achieving real-time acceleration remains elusive. To address
+this, we conducted experiments to rethink the complexity
+problem in NVC acceleration.
+In CNNs, computational complexity Pcomp are typically
+dominated by matrix multiplications, often mitigated by re-
+ducing the channel C, as it scales computational complexity
+by O(C2). However, our findings reveal that reducing C
+does not result in the expected quadratic speedup. As il-
+lustrated in Fig. 3 (a), speed improves in a more linear
+fashion as C decreases. This suggests that factors other than
+computational complexity are limiting the coding speed.
+In practice, numerous factors influence coding speed. We
+identify two key factors: 1) latent representation size Psize,
+which primarily influences memory I/O costs of latent ten-
+sors; and 2) number of modules Pnum, which affects the
+total operation counts and the overhead of function calls.
+These factors primarily influence additional operations be-
+yond hardware computations, which we term operational
+complexity, distinct from computational complexity. We
+conducted experiments that independently controlled Pcomp,
+Psize and Pnum to observe their impact on inference speed.
+The independent control of each factor is achieved by bal-
+ancing the number of modules N, channel C and latent
+resolution H × W. For example, halving C while doubling
+H × W maintains a constant Psize but reduces Pcomp due
+to its quadratic relationship with C.
+The results in Fig. 3 (b) reveal several key insights. 1) Op-
+erational complexity, rather than computational complexity,
+is the main speed bottleneck. Reducing computational costs
+3
+
+---PAGE BREAK---
+(a) Impact of channel reduction on speed
+(b) Independent computational / operational complexity reduction
+Baseline w/ High Computational Complexity
+Baseline w/ Low Computational Complexity
+𝑃𝑐𝑜𝑚𝑝↓
+𝑃𝑠𝑖𝑧𝑒↓
+𝑃𝑛𝑢𝑚↓
+𝑃𝑐𝑜𝑚𝑝↓
+𝑃𝑠𝑖𝑧𝑒↓
+𝑃𝑛𝑢𝑚↓
+𝐶↓
+𝑃𝑐𝑜𝑚𝑝 ~ 𝑂𝐶2 ↓
+𝑃𝑠𝑖𝑧𝑒 ~ 𝑂(𝐶) ↓
+𝐶↓     →    𝑃𝑐𝑜𝑚𝑝↓         𝑃𝑠𝑖𝑧𝑒↓
+&
+Figure 3. Analysis on computational complexity Pcomp and operational complexity, including latent representation size Psize and number of
+modules Pnum. (a) Reducing channels results in a quadratic decrease in Pcomp, yet inference time decreases almost linearly, indicating that
+computational cost is not the primary speed bottleneck. (b) We independently reduce one of Pcomp, Psize and Pnum to identify the main
+factors affecting time cost. Results show that Psize is most critical at high computational complexity, while the Pnum is more significant at
+low computational complexity.
+without addressing operational factors leads to only marginal
+improvements in inference time. This also explains why re-
+ducing channels results in a linear, rather than quadratic,
+decrease in time—since the latent size decreases linearly
+with the number of channels. 2) When computational com-
+plexity is high, latent representation size becomes the domi-
+nant limiting factor. When computational complexity is low,
+the number of modules becomes the key bottleneck. This
+suggests that different parts of the model require different
+optimization strategies.
+These insights offer a new perspective on accelerating
+NVCs by reducing operational complexity. Typically, lower-
+ing computational complexity leads to diminished compres-
+sion performance. However, since computational complexity
+is no longer the primary speed bottleneck, we can focus on
+lowering operational complexity while preserving computa-
+tional capacity. In our design, we prioritize computational
+capability to the most critical modules while eliminating less
+essential ones, which ensures sufficient model capacity and
+achieves a better rate-distortion-complexity trade-off.
+4. Towards Practical Real-Time NVC
+4.1. Overview
+The framework of the proposed DCVC-RT is illustrated in
+Fig. 4. To compress current frame xt, we first patchfy it
+into 1
+8-scale latents using patch embedding [13]. Then we
+perform conditional coding [18, 25, 28] in this single low
+resolution (Section 4.2) to achieve efficient coding. During
+extracting the temporal context information, DCVC-RT in-
+corporates implicit temporal modeling (Section 4.3) to avoid
+complex motion-estimation-motion-compensation process.
+To improve versatility, we introduce a module-bank-based
+rate-control method (Section 4.4) and enable model inte-
+gerization (Section 4.5) for cross-device consistency.
+4.2. Latents at Single Low Resolution
+Originating from the concept of compressive auto-encoders
+[46], most NVCs progressively downsample latents to reduce
+the dimension. At each layer, they downsample the latent
+by half while doubling the number of channels. It enables a
+comparable computational capacity Pcomp across layers,
+  P_{ c omp} \s i m O ( (2C) ^ 2\cd o t H / 2\cdot W / 2)=O(C^2\cdot H\cdot W) 
+(1)
+while the latent size Psize is gradually reduced
+  P_{ s iz e } = 2C\ c dot H / 2\cdot W / 2=1 / 2\cdot C\cdot H\cdot W 
+(2)
+In Section. 3, we learn that the latent size can be the main
+bottleneck for coding speed. From this operational complex-
+ity perspective, a question arises: can we learn latents at a
+single low resolution to eliminate the high operational costs
+associated with a large Psize? To explore this, we directly
+downsample frames to a single scale using patch embed-
+ding and apply conditional coding to compress them at the
+same scale. Results in Fig. 5 (a) prove the feasibility of
+this method, where learning single low scale latents notably
+boosts encoding speed. For example, learning latents at 1/8
+scale is about 3.6× faster than progressive downsampling.
+While reducing latent scales accelerate model inference,
+it also impacts rate-distortion performance. Although com-
+putational capacity is maintained across scales, the varied
+receptive field may influence the performance. At a single
+high 1/2 resolution, the restricted receptive field results in no-
+table performance degradation. However, as scales decrease,
+4
+
+---PAGE BREAK---
+Entropy
+Model
+𝑤𝑡
+𝑑
+𝑤𝑡
+𝑒
+AD
+Q
+AE
+DC Block
+DC Block
+Encoder
+ො𝑦𝑡
+Conv
+DC Block
+Decoder
+𝑓𝑡
+𝑓𝑡−1
+Feature Extractor
+𝑦𝑡
+DC Block
+DC Block
+DC Block
+DC Block
+෤𝑦𝑡
+1
+DC Block
+Patchfy ↓8
+Conv ↓2
+DC Block
+DC Block
+Conv ↑2
+Recon.
+Generation
+Unpatchfy ↑8
+𝑞𝑟
+DC Block
+DC Block
+Entropy Model
+Two-Step
+Entropy 
+Estimation
+෤𝑦𝑡
+1
+𝐹𝑡−1
+𝑒
+(𝜇, 𝜎)
+𝑦𝑡
+Factorized
+Prior
+DC Block
+DC Block
+DC Block
+DC Block
+Buffer
+C
+C
+𝐹𝑡−1
+𝐹𝑡−1
+𝐹𝑡−1
+𝐹𝑡−1
+𝑒
+𝑥𝑡
+ො𝑥𝑡
+𝑞𝑒
+𝑞𝑑
+𝑞𝑓
+𝑞𝑟
+Module 
+Bank
+Factorized
+Prior
+𝑞𝑒
+𝑞𝑑
+𝑞𝑓
+𝑞𝑟
+𝑞𝑟
+𝑞𝑝
+𝑧𝑡
+Ƹ𝑧𝑡
+Hyper
+Enc.
+Hyper
+Dec.
+Figure 4. Framework overview. DC Block, Q, AE and AD represent depth-wise convolution block, quantization, arithmetic encoder and
+decoder, respectively. Ft−1 and F e
+t−1 are temporal contexts extracted from previously decoded latent ft−1. Frames are transformed into
+latents at 1/8 resolution using patch embedding [13], and key modules such as the encoder, decoder, frame extractor, and reconstruction
+generation operate at this single scale for efficient feature learning. DCVC-RT eliminates explicit motion modeling, resulting in a streamlined
+design with drastically reduced operational complexity and real-time performance.
+the receptive field expands significantly, and at 1/8 scale, it
+even surpasses the receptive field of progressive downsam-
+pling. This extended receptive field is essential for enhancing
+temporal modeling and reducing temporal redundancy, lead-
+ing to a comparable BD-Rate of 0.3% under the same model
+capacity. However, a performance drop is observed at 1/16
+scale. In our model, 1/16 scale latents with C = 512 yields
+a latent size of 512·H/16·W/16 = 2·H ·W, which is even
+smaller than the original frame 3 · H · W. It significantly
+limits representative capacity and degrades the compression
+ratio. In contrast, at the 1/8 scale, using C = 256 yields a
+sufficient latent size of 4 · H · W. Considering these factors,
+we adopt 1/8 single-scale latent learning.
+4.3. Implicit Temporal Modelling
+In video coding, temporal correlation modeling is crucial
+for effective redundancy reduction. Most existing NVCs
+achieve this by an explicit motion estimation and motion
+compensation process. Typically, motion coding needs low
+computational complexity since motions are simpler and
+easier for compression. However, we observe that existing
+motion modules usually use a high number of module layers.
+For example, we observe that the motion coding branch in
+[28] exhibits 13× lower computational complexity than the
+conditional coding branch (74 kMACs per pixel versus 932
+kMACs per pixel), despite having up to half as many convo-
+lutional layers (123 layers versus 225 layers). As discussed
+in Section 3, this high number of layers increases opera-
+tional complexity, becoming the primary speed bottleneck
+for low-computational-complexity motion modules.
+To address this, DCVC-RT adopts implicit temporal mod-
+eling, extracting temporal context using a single and simple
+feature extractor instead of complex motion-based tempo-
+ral context extraction. Technically, this temporal context
+is concatenated with the current latent along the channel
+dimension, allowing the encoder-decoder to process them
+jointly for redundancy reduction. By eliminating the need for
+motion estimation and compensation, the number of mod-
+ules is directly reduced to lower the operation frequency,
+significantly enhancing the coding speed.
+Analysis on Different Motion Contents. We compare
+implicit and explicit modeling across different motion types
+for a more comprehensive evaluation.As shown in Tab. 1,
+implicit modeling slightly improves BD-Rate by 0.4% on
+small motions while showing a modest 3.2% reduction on
+large motions. Nonetheless, with a 3.4× faster encoding
+time, implicit modeling is a more practical solution for real-
+time applications. Additionally, it surpasses explicit motions
+in scene changes scenarios, since scene change cannot be
+effectively modeled by motions. These results highlight its
+advantages in the rate-distortion-complexity trade-off.
+4.4. Module-Bank-Based Rate Control
+In DCVC-RT, rate control is achieved through variable-
+rate coding with dynamic rate adjustment. While existing
+variable-rate codecs [28, 43] primarily focus on adjusting
+the distribution of latent y, they typically compress hyper
+information z using a single factorized prior module. Since
+z generally accounts for less than 1% of the total bits, it has
+minimal impact on their performance. However, in DCVC-
+5
+
+---PAGE BREAK---
+Table 1. Ablation study on implicit temporal modelling. We compare it with using explicit motions under different motion contents. The
+motion range is measured using a pretrained SEA-RAFT [52]. Further details are provided in the supplementary material.
+Temporal Modelling
+BD-Rate
+Encoding Time
+MCL-JCV Average
+Large Motion
+Small Motion
+Scene Change
+Explicit Motions
+0.0%
+0.0%
+0.0%
+0.0%
+27.2 ms (3.4×)
+Implicit Temporal Modelling
+2.1%
+3.2%
+–0.4%
+–4.7%
+8.0 ms (1×)
+Single factorized module for 𝑧
+Rate-adjustment module bank
+Indeterministic floating-point calculation
+Model Integerization → Deterministic integer calculations 
+(c) Effects of model intergerization
+(b) Effects of rate-adjustment module bank
+(a) Ablation study on latent resolutions
+3.4% bits 
+saving 
+on UVG
+Entropy Coding 
+inconsistency
+Progressive Downsample
+(Multi-Scale) BD-Rate
+Single-Scale
+BD-Rate
+Single-Scale
+Encoding Time
+Progressive Downsample
+(Multi-Scale) Encoding Time
+Figure 5. Analysis of different components. (a) Ablation study on learning latent representations at a single resolution. All models maintain
+equal computational complexity (MACs) for fairness. (b) Example of probability estimation of z. Using a module bank instead of a single
+factorized module achieves an average bit savings of 3.4%. (c) Cross platform coding test. We perform encoding on an NVIDIA A100 GPU,
+while decoding uses an RTX 2080Ti. Model integerization effectively eliminates coding inconsistencies across platforms.
+RT, we find that z contributes over 10% bits of y on average,
+since the absence of motion bits makes z critical in spatial-
+temporal modeling. In this case, inaccurate distribution
+estimation for z severely affects overall performance.
+To address this, we introduce a rate-adjustment module
+bank (shown in the top left of Fig. 4). It learns a range of
+hyperprior modules model varied distributions across differ-
+ent quantization parameter (qp). As shown in Fig. 5 (b), this
+module bank closely aligns estimated distributions with ac-
+tual distributions, achieving about 3% bit savings. Extending
+this approach, we further introduce separate vector banks
+for different modules (e.g., qe, qd, qf and qr for encoder,
+decoder, feature extractor, and reconstruction network, re-
+spectively). Each vector bank is designed to learn a set of
+vectors that adaptively scale the latent representations based
+on their characteristics, enabling flexible and fine-grained
+amplitude adjustments. DCVC-RT achieves efficient rate
+control using this module bank, with the rate-control results
+provided in the supplementary material.
+Moreover, DCVC-RT supports hierarchical quality con-
+trol by adjusting qp offsets for different frames. Compared
+to [28] that employs separate feature adaptors for this pur-
+pose, our method achieves improved consistency with rate
+adjustment and enhanced flexibility in practical applications.
+4.5. Model integerization
+For NVCs, the indeterminism of floating-point calculations
+can cause inconsistencies when distributing video content.
+To address this, we implement 16-bit model integerization.
+This approach enables deterministic integer calculations and
+ensures consistent output across different devices. More
+concretely, the equation between a floating-point feature
+value vf and an int16 value vi is as follows
+  v _i = \te x t {round}(K_1\cdot v_f) \label {equ:float-to-int} 
+(3)
+We set K1 = 512, such that the floating-point value 1.0 is
+mapped to 512 in int16, and given that the valid int16 range is
+[−32768, 32767], the corresponding range of floating-point
+values is [−64.0, 63.998]. We observe this is sufficiently
+large to represent the values during model inference. We
+set the accumulator data type to int32 in convolutional ker-
+nels, and no overflow issues have been observed. Besides
+convolutions and basic arithmetic operations, we adopt a
+precomputed lookup table to handle the nonlinear Sigmoid
+function, that maps an arbitrary int16 value to its correspond-
+ing output. Through this training-free model integerization,
+DCVC-RT can perform deterministic integer calculations,
+ensuring cross-device consistency. An example is shown in
+Fig. 5 (c), with further results in the supplementary material.
+6
+
+---PAGE BREAK---
+Table 2. BD-Rate (%) comparison in YUV420 colorspace. All frames with intra-period=–1.
+UVG
+MCL-JCV HEVC B HEVC C HEVC D HEVC E Average
+Coding Speed
+Enc.
+Dec.
+VTM-17.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.01 fps
+23.6 fps
+HM-16.25
+40.1
+48.6
+47.6
+41.0
+34.5
+42.8
+42.4
+0.05 fps
+39.6 fps
+ECM-11.0
+−20.0
+−22.1
+−22.2
+−21.2
+−20.4
+−17.2
+−20.5
+0.002 fps
+3.4 fps
+DCVC-DC
+6.5
+−4.4
+13.1
+−3.4
+−14.8
+90.2
+14.5
+3.3 fps
+4.3 fps
+DCVC-FM
+−17.6
+−8.4
+−15.7
+−30.2
+−37.6
+−23.0
+−22.1
+3.4 fps
+4.2 fps
+DCVC-FM (fp16) −16.8
+−8.0
+−15.4
+−30.2
+−37.5
+−20.2
+−21.3
+5.0 fps
+5.9 fps
+DCVC-RT (fp16) −24.0
+−14.8
+−16.6
+−21.0
+−27.3
+−22.4
+−21.0
+125.2 fps 112.8 fps
+Note: Some values differ slightly from those in [28] since we use actual BPP instead of estimated BPP.
+Figure 6. Rate-distortion curves for UVG. All frames are tested in YUV420 colorspace with intra-period=–1. Results on more datasets are in
+the supplementary materials.
+5. Experiments
+5.1. Settings
+Datasets. We use Vimeo-90k [53] to train DCVC-RT with
+7-frame sequences, and process the original Vimeo videos
+[5] to create longer sequences for fine-tuning by following
+[28]. We evaluate DCVC-RT on HEVC Class B∼E [15],
+UVG [38], and MCL-JCV [51].
+Test Details. For traditional codecs, we compare with HM
+[2], VTM [3] and ECM[1], which represent the best H.265,
+H.266 encoder and the prototype of next generation tradi-
+tional codec, respectively. Detailed configurations are pro-
+vided in the supplementary material. For neural codecs, we
+compare with advanced NVCs including DCVC-DC [27]
+and DCVC-FM [28]. Following [28], we test all frames with
+an intra-period of –1 on YUV420 and RGB colorspace. We
+conduct all tests under low delay conditions. Rate-distortion
+performance is assessed by the BD-Rate [11]. Additionally,
+we note that many existing NVCs compare with traditional
+codecs using the estimated entropy, which is unfair as they
+overlook header information. In this paper, we ensure a fair
+comparison by retesting them with actual binary bit-streams
+that include necessary header information. By default, cod-
+ing speed is tested on a single NVIDIA A100 GPU with
+an AMD EPYC 7V13 processor. We measure the average
+latency across different quantization parameters (qp) on a
+resolution of 1920 × 1080.
+Training Details. To accommodate variable rates within
+a single model, we randomly assign different qp between
+[0, 63] in each training iteration. In a group of 8 pictures, the
+qp offset is set to [0, 8, 0, 4, 0, 4, 0, 4] for hierarchical quality.
+We follow [27] to adopt a hierarchical weight setting for the
+distortion term to support a hierarchical quality structure.
+The corresponding λ values are interpolated between 1 and
+768, following the same method as in [28]. We use the com-
+bined distortion loss in both YUV and RGB colorspace [28]
+to support both colorspace in a single model.
+5.2. Comparison Results
+In Tab.
+2, we present the BD-rate comparison for the
+YUV420 format under all frame intra period –1 settings. As
+depicted in the table, DCVC-RT achieves an average 21.0%
+bits saving compared to VTM, which is slightly better than
+20.5% of ECM. It showcases comparable compression ra-
+tio to the advanced NVC DCVC-FM with an impressive
+25 times faster encoding speed, reaching 125.2 fps for en-
+coding and 112.8 fps for decoding. This demonstrate the
+superior performance of DCVC-RT in term of rate-distortion-
+7
+
+---PAGE BREAK---
+Table 3. Complexity analysis. The encoding / decoding speed (measured in frames per second, fps) are evaluated across various resolutions
+and devices, including the NVIDIA A100, NVIDIA A6000, RTX 4090, and RTX 2080 Ti. Average BD-Rate results are presented using
+VTM as the anchor. MACs are tested on 1080p videos. OOM indicates out-of-memory conditions.
+Model
+Average BD-Rate
+MACs
+Params
+DCVC-DC
+14.5%
+2642G
+19.8M
+DCVC-FM (fp16)
+–21.3%
+2642G
+18.3M
+DCVC-RT (fp16)
+–21.0%
+385G
+20.7M
+DCVC-RT (int16)
+–18.3%
+385G
+20.7M
+(a) Computational complexity and BD-Rate.
+Model
+A100
+A6000
+4090
+2080Ti
+DCVC-DC
+3.3 / 4.3
+1.7 / 2.2
+2.3 / 2.9
+0.8 / 1.4
+DCVC-FM (fp16)
+5.0 / 5.9
+3.1 / 3.8
+3.7 / 4.4
+1.9 / 2.3
+DCVC-RT (fp16)
+125.2 / 112.8
+70.4 / 63.8
+118.8 / 105.3
+39.5 / 34.1
+DCVC-RT (int16)
+28.3 / 20.9
+23.4 / 17.5
+52.3 / 38.8
+18.4 / 13.4
+(b) Coding speed on 1920 × 1080 videos.
+Model
+A100
+A6000
+4090
+2080Ti
+DCVC-DC
+0.8 / 1.0
+0.4 / 0.5
+OOM
+OOM
+DCVC-FM (fp16)
+1.0 / 1.2
+0.6 / 0.7
+OOM
+OOM
+DCVC-RT (fp16)
+35.5 / 29.5
+18.5 / 16.2
+29.9 / 26.5
+11.6 / 9.9
+DCVC-RT (int16)
+7.3 / 5.2
+6.1 / 4.4
+12.5 / 9.5
+4.4 / 3.2
+(c) Coding speed on 3840 × 2160 videos.
+Model
+A100
+A6000
+4090
+2080Ti
+DCVC-DC
+6.5 / 7.9
+3.5 / 4.3
+5.5 / 6.7
+2.1 / 2.9
+DCVC-FM (fp16)
+8.5 / 9.4
+5.9 / 6.6
+9.3 / 10.4
+4.0 / 4.7
+DCVC-RT (fp16)
+173.9 / 149.2
+147.3 / 132.5
+225.1 / 185.2
+73.3 / 67.0
+DCVC-RT (int16)
+51.7 / 39.2
+49.5 / 38.1
+105.2 / 81.1
+37.0 / 25.8
+(d) Coding speed on 1280 × 720 videos.
+complexity trade-off. In the RGB colorspace, DCVC-RT
+achieves a 14.0% bits saving compared to VTM, closely
+matching the 15.8% savings of DCVC-FM. Detailed results
+are provided in the supplementary material.
+Fig. 6 presents the rate-distortion curve on UVG. DCVC-
+RT showcases better performance with VTM across the
+entire quality range. Particularly in the low-quality range
+(< 0.02 bpp), DCVC-RT exhibits the best performance.
+However, there is a performance drop in the high-quality
+range. This drop can be attributed to the lightweight model
+design adopted in DCVC-RT, resulting in reduced model
+capability compared to larger models. Notably, this drop
+mainly occurs above 40 dB, where human vision struggles
+to distinguish between different qualities. In the supple-
+mentary material, we further examine the compression per-
+formance of DCVC-RT as model capacity increases. Our
+large model achieves the highest compression ratio across
+all bitrate ranges while maintaining real-time performance.
+5.3. Complexity Analysis
+Tab.
+3 presents the complexity analysis.
+Compared to
+DCVC-DC and DCVC-FM, DCVC-RT achieves signifi-
+cantly lower computational complexity while maintaining
+a comparable compression ratio. Coding speed is evaluated
+across multiple input resolutions and GPU devices, consis-
+tently demonstrating at least a 20× speed improvement. On
+the A100 GPU, DCVC-RT (fp16) reaches real-time 4K 30fps
+coding, while on consumer-grade devices like the RTX 2080
+Ti, it achieves 1080p 30fps coding. These results highlight
+the efficiency of DCVC-RT across diverse conditions.
+5.4. Integerization Results
+Our model supports 16-bit integer calculations. As shown in
+Tab. 3, our integerization strategy introduces minimal impact
+on compression performance, with DCVC-RT (int16) still
+outperforming VTM by 18.3%. Dataset-specific BD-Rate
+results are in the supplementary material. In terms of coding
+speed, DCVC-RT (int16) achieves 1080p 30 fps coding on
+an RTX 4090 and 720p 24 fps coding on an RTX 2080Ti.
+However, we observe a significant slowdown in coding
+speed when using int16 mode compared to fp16. This is
+mainly because most modern GPUs lack dedicated optimiza-
+tion for int16 operations. This difference is particularly
+pronounced on the A100 GPU, where highly optimized Ten-
+sor Cores make fp16 processing over four times faster than
+int16. Although int16 mode theoretically has the potential to
+enable faster inference than fp16, we anticipate that future
+hardware developments and engineering will help bridge this
+performance gap.
+6. Conclusion and Limitation
+In this paper, we propose a practical, real-time neural video
+codec (NVC) focused on high compression ratio, low latency,
+and broad versatility. By analyzing the complexity of NVCs,
+we identify operational cost, rather than computational cost,
+as the primary bottleneck to coding speed. Based on this
+insight, we employ implicit temporal modeling and a sin-
+gle low-resolution latent representation, which significantly
+accelerates processing without compromising compression
+quality. Additionally, we introduce model integerization for
+consistent cross-device coding and a module-bank-based
+rate control scheme to enhance practical adaptability. As far
+as we known, DCVC-RT is the first NVC achieving 110 fps
+coding on 1080p video with a 21% bitrate savings compared
+to H.266/VTM. DCVC-RT serves as a notable landmark in
+the journey of NVC evolution.
+While DCVC-RT supports int16 mode, its coding speed
+remains slower than fp16 due to limited hardware optimiza-
+tion for int16 inference. In the future, we hope this can be
+solved by further hardware optimization and engineering.
+8
+
+---PAGE BREAK---
+References
+[1] ECM. https://vcgit.hhi.fraunhofer.de/ecm/
+ECM.
+[2] HM.
+https://vcgit.hhi.fraunhofer.de/
+jvet/HM.
+[3] VTM.
+https://vcgit.hhi.fraunhofer.de/
+jvet/VVCSoftware_VTM.
+[4] FFmpeg. https://www.ffmpeg.org/.
+[5] Original Vimeo links.
+https : / / github . com /
+anchen1011 / toflow / blob / master / data /
+original_vimeo_links.txt.
+[6] Eirikur Agustsson, David Minnen, Nick Johnston, Johannes
+Balle, Sung Jin Hwang, and George Toderici. Scale-space
+flow for end-to-end optimized video compression. In Pro-
+ceedings of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition, pages 8503–8512, 2020.
+[7] David Alexandre, Hsueh-Ming Hang, and Wen-Hsiao Peng.
+Hierarchical B-frame Video Coding Using Two-Layer CANF
+without Motion Coding. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition,
+pages 10249–10258, 2023.
+[8] E. Alshina, J. Ascenso, T. Ebrahimi, F. Pereira, and T. Richter.
+[AHG 11] Brief information about JPEG AI CfP status. In
+JVET-AA0047, 2022.
+[9] Anchors · JPEG-AI MMSP Challenge. Anchors · JPEG-AI
+MMSP Challenge. https://jpegai.github.io/7-
+anchors/.
+[10] Johannes Ball´e, Nick Johnston, and David Minnen. Integer
+networks for data compression with latent-variable models. In
+International Conference on Learning Representations, 2018.
+[11] Gisle Bjontegaard. Calculation of average PSNR differences
+between RD-curves. VCEG-M33, 2001.
+[12] Zhenghao Chen, Lucas Relic, Roberto Azevedo, Yang Zhang,
+Markus Gross, Dong Xu, Luping Zhou, and Christopher
+Schroers. Neural Video Compression with Spatio-Temporal
+Cross-Covariance Transformers. In Proceedings of the 31st
+ACM International Conference on Multimedia, pages 8543–
+8551, 2023.
+[13] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov,
+Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner,
+Mostafa Dehghani, Matthias Minderer, Georg Heigold, Syl-
+vain Gelly, Jakob Uszkoreit, and Neil Houlsby. An Image is
+Worth 16x16 Words: Transformers for Image Recognition at
+Scale. In International Conference on Learning Representa-
+tions, 2021.
+[14] Stefan Elfwing, Eiji Uchibe, and Kenji Doya.
+Sigmoid-
+weighted linear units for neural network function approx-
+imation in reinforcement learning. Neural networks, 107:
+3–11, 2018.
+[15] D Flynn, K Sharman, and C Rosewarne. Common Test Con-
+ditions and Software Reference Configurations for HEVC
+Range Extensions, document JCTVC-N1006. Joint Collabo-
+rative Team Video Coding ITU-T SG, 16.
+[16] Ge Gao, Ho Man Kwan, Fan Zhang, and David Bull.
+Pnvc: Towards practical inr-based video compression. arXiv
+preprint arXiv:2409.00953, 2024.
+[17] Dailan He, Ziming Yang, Yuan Chen, Qi Zhang, Hong-
+wei Qin, and Yan Wang.
+Post-training quantization for
+cross-platform learned image compression. arXiv preprint
+arXiv:2202.07513, 2022.
+[18] Yung-Han Ho, Chih-Peng Chang, Peng-Yu Chen, Alessan-
+dro Gnutti, and Wen-Hsiao Peng. CANF-VC: Conditional
+augmented normalizing flows for video compression.
+In
+European Conference on Computer Vision, pages 207–223.
+Springer, 2022.
+[19] Zhihao Hu and Dong Xu. Complexity-guided slimmable
+decoder for efficient deep video compression. In Proceedings
+of the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 14358–14367, 2023.
+[20] Zhihao Hu, Guo Lu, Jinyang Guo, Shan Liu, Wei Jiang, and
+Dong Xu. Coarse-to-fine deep video coding with hyperprior-
+guided mode prediction. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition,
+pages 5921–5930, 2022.
+[21] Zhaoyang Jia, Jiahao Li, Bin Li, Houqiang Li, and Yan Lu.
+Generative latent coding for ultra-low bitrate image compres-
+sion. In Proceedings of the IEEE/CVF Conference on Com-
+puter Vision and Pattern Recognition, pages 26088–26098,
+2024.
+[22] Hyunjik Kim, Matthias Bauer, Lucas Theis, Jonathan Richard
+Schwarz, and Emilien Dupont. C3: High-performance and
+low-complexity neural compression from a single image or
+video. pages 9347–9358, 2024.
+[23] Th´eo Ladune, Pierrick Philippe, Wassim Hamidouche, Lu
+Zhang, and Olivier D´eforges. Conditional Coding for Flexible
+Learned Video Compression. In Neural Compression: From
+Information Theory to Applications – Workshop @ ICLR
+2021, 2021.
+[24] Hoang Le, Liang Zhang, Amir Said, Guillaume Sautiere,
+Yang Yang, Pranav Shrestha, Fei Yin, Reza Pourreza, and
+Auke Wiggers. MobileCodec: neural inter-frame video com-
+pression on mobile devices. In Proceedings of the 13th ACM
+Multimedia Systems Conference, pages 324–330, 2022.
+[25] Jiahao Li, Bin Li, and Yan Lu. Deep contextual video com-
+pression. Advances in Neural Information Processing Sys-
+tems, 34:18114–18125, 2021.
+[26] Jiahao Li, Bin Li, and Yan Lu. Hybrid spatial-temporal en-
+tropy modelling for neural video compression. In Proceedings
+of the 30th ACM International Conference on Multimedia,
+pages 1503–1511, 2022.
+[27] Jiahao Li, Bin Li, and Yan Lu. Neural video compression with
+diverse contexts. In Proceedings of the IEEE/CVF Conference
+on Computer Vision and Pattern Recognition, pages 22616–
+22626, 2023.
+[28] Jiahao Li, Bin Li, and Yan Lu. Neural Video Compression
+with Feature Modulation. In IEEE/CVF Conference on Com-
+puter Vision and Pattern Recognition, CVPR 2024, Seattle,
+WA, USA, June 17-21, 2024, 2024.
+[29] Jianping Lin, Dong Liu, Houqiang Li, and Feng Wu. M-LVC:
+Multiple frames prediction for learned video compression.
+In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, pages 3546–3554, 2020.
+[30] Bowen Liu, Yu Chen, Rakesh Chowdary Machineni, Shiyu
+Liu, and Hun-Seok Kim. MMVC: Learned Multi-Mode Video
+9
+
+---PAGE BREAK---
+Compression with Block-based Prediction Mode Selection
+and Density-Adaptive Entropy Coding. In Proceedings of
+the IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 18487–18496, 2023.
+[31] Jerry Liu, Shenlong Wang, Wei-Chiu Ma, Meet Shah, Rui
+Hu, Pranaab Dhawan, and Raquel Urtasun. Conditional en-
+tropy coding for efficient video compression. In European
+Conference on Computer Vision, pages 453–468. Springer,
+2020.
+[32] Jinming Liu, Heming Sun, and Jiro Katto. Learned image
+compression with mixed transformer-cnn architectures. In
+Proceedings of the IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition, pages 14388–14397, 2023.
+[33] Guo Lu, Wanli Ouyang, Dong Xu, Xiaoyun Zhang, Chunlei
+Cai, and Zhiyong Gao. DVC: An end-to-end deep video
+compression framework. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition,
+pages 11006–11015, 2019.
+[34] Guo Lu, Xiaoyun Zhang, Wanli Ouyang, Li Chen, Zhiyong
+Gao, and Dong Xu. An end-to-end learning framework for
+video compression. IEEE transactions on pattern analysis
+and machine intelligence, 43(10):3292–3308, 2020.
+[35] Ming Lu, Zhihao Duan, Wuyang Cong, Dandan Ding,
+Fengqing Zhu, and Zhan Ma. High-Efficiency Neural Video
+Compression via Hierarchical Predictive Learning. arXiv
+preprint arXiv:2410.02598, 2024.
+[36] Ming Lu, Zhihao Duan, Fengqing Zhu, and Zhan Ma. Deep
+Hierarchical Video Compression. In Proceedings of the AAAI
+Conference on Artificial Intelligence, pages 8859–8867, 2024.
+[37] Fabian Mentzer, George D Toderici, David Minnen, Sergi
+Caelles, Sung Jin Hwang, Mario Lucic, and Eirikur Agustsson.
+VCT: A Video Compression Transformer. In Advances in
+Neural Information Processing Systems, pages 13091–13103,
+2022.
+[38] Alexandre Mercat, Marko Viitanen, and Jarno Vanne. UVG
+dataset: 50/120fps 4K sequences for video codec analysis and
+development. In Proceedings of the 11th ACM Multimedia
+Systems Conference, pages 297–302, 2020.
+[39] David Minnen, Johannes Ball´e, and George D Toderici. Joint
+autoregressive and hierarchical priors for learned image com-
+pression. Advances in neural information processing systems,
+31, 2018.
+[40] Reza Pourreza, Hoang Le, Amir Said, Guillaume Sautiere,
+and Auke Wiggers. Boosting neural video codecs by exploit-
+ing hierarchical redundancy. In Proceedings of the IEEE/CVF
+Winter Conference on Applications of Computer Vision, pages
+5355–5364, 2023.
+[41] Linfeng Qi, Jiahao Li, Bin Li, Houqiang Li, and Yan Lu. Mo-
+tion Information Propagation for Neural Video Compression.
+In Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition, pages 6111–6120, 2023.
+[42] Linfeng Qi, Zhaoyang Jia, Jiahao Li, Bin Li, Houqiang Li,
+and Yan Lu. Long-term temporal context gathering for neural
+video compression. In European Conference on Computer
+Vision, pages 305–322. Springer, 2024.
+[43] Oren Rippel, Alexander G Anderson, Kedar Tatwawadi, San-
+jay Nair, Craig Lytle, and Lubomir Bourdev. ELF-VC: Effi-
+cient learned flexible-rate video coding. In Proceedings of
+the IEEE/CVF International Conference on Computer Vision,
+pages 14479–14488, 2021.
+[44] Xihua Sheng, Jiahao Li, Bin Li, Li Li, Dong Liu, and Yan
+Lu. Temporal context mining for learned video compression.
+IEEE Transactions on Multimedia, 2022.
+[45] Yibo Shi, Yunying Ge, Jing Wang, and Jue Mao. AlphaVC:
+High-performance and efficient learned video compression.
+In European Conference on Computer Vision, pages 616–631.
+Springer, 2022.
+[46] L. Theis, W. Shi, A. Cunningham, and F. Husz´ar. Lossy image
+compression with compressive autoencoders. 2017.
+[47] Kuan Tian, Yonghang Guan, Jinxi Xiang, Jun Zhang, Xiao
+Han, and Wei Yang. Towards real-time neural video codec
+for cross-platform application using calibration information.
+In Proceedings of the 31st ACM International Conference on
+Multimedia, pages 7961–7970, 2023.
+[48] Ties Van Rozendaal, Iris AM Huijben, and Taco S Cohen.
+Overfitting for fun and profit: Instance-adaptive data com-
+pression. arXiv preprint arXiv:2101.08687, 2021.
+[49] Ties van Rozendaal, Tushar Singhal, Hoang Le, Guillaume
+Sautiere, Amir Said, Krishna Buska, Anjuman Raha, Dimitris
+Kalatzis, Hitarth Mehta, Frank Mayer, et al. MobileNVC:
+Real-time 1080p Neural Video Compression on a Mobile
+Device. In Proceedings of the IEEE/CVF Winter Conference
+on Applications of Computer Vision, pages 4323–4333, 2024.
+[50] Guo-Hua Wang, Jiahao Li, Bin Li, and Yan Lu. EVC: Towards
+Real-Time Neural Image Compression with Mask Decay. In
+International Conference on Learning Representations, 2023.
+[51] Haiqiang Wang, Weihao Gan, Sudeng Hu, Joe Yuchieh Lin,
+Lina Jin, Longguang Song, Ping Wang, Ioannis Katsavouni-
+dis, Anne Aaron, and C-C Jay Kuo. MCL-JCV: a JND-based
+H. 264/AVC video quality assessment dataset. In 2016 IEEE
+international conference on image processing (ICIP), pages
+1509–1513. IEEE, 2016.
+[52] Yihan Wang, Lahav Lipson, and Jia Deng. SEA-RAFT: Sim-
+ple, efficient, accurate raft for optical flow. In European Con-
+ference on Computer Vision, pages 36–54. Springer, 2025.
+[53] Tianfan Xue, Baian Chen, Jiajun Wu, Donglai Wei, and
+William T Freeman. Video enhancement with task-oriented
+flow. International Journal of Computer Vision, 127(8):1106–
+1125, 2019.
+[54] Ren Yang, Fabian Mentzer, Luc Van Gool, and Radu Timofte.
+Learning for video compression with recurrent auto-encoder
+and recurrent probability model. IEEE Journal of Selected
+Topics in Signal Processing, 15(2):388–401, 2020.
+[55] Yibo Yang and Stephan Mandt. Computationally-efficient
+neural image compression with shallow decoders. In Proceed-
+ings of the IEEE/CVF International Conference on Computer
+Vision, pages 530–540, 2023.
+[56] Xinjie Zhang, Xingtong Ge, Tongda Xu, Dailan He, Yan
+Wang, Hongwei Qin, Guo Lu, Jing Geng, and Jun Zhang.
+Gaussianimage: 1000 fps image representation and compres-
+sion by 2d gaussian splatting. In European Conference on
+Computer Vision, pages 327–345. Springer, 2024.
+[57] Yiwei Zhang, Guo Lu, Yunuo Chen, Shen Wang, Yibo Shi,
+Jing Wang, and Li Song. Neural Rate Control for Learned
+Video Compression. In The Twelfth International Conference
+on Learning Representations, 2023.
+10
+
+---PAGE BREAK---
+Appendices
+This document provides the supplementary material to our
+proposed practical real-time neural video codec (NVC), i.e.
+DCVC-RT.
+A. Test Settings
+For a fairer comparison with traditional codecs, we employ
+their best settings to represent their best compression ratio.
+We test them in both YUV420 and RGB colorespaces for a
+comprehensive comparison.
+YUV420 colorspace. We focus our comparison on the
+YUV420 colorspace, which is commonly optimized in tra-
+ditional video codecs. Our evaluation includes the com-
+parison with HM [2], VTM [3], and ECM [1], represent-
+ing the best H.265 encoder, the best H.266 encoder, and
+the prototype of the next-generation traditional codec, re-
+spectively. For each traditional codec, we utilize the offi-
+cially provided config files: encoder lowdelay main10.cfg,
+encoder lowdelay vtm.cfg, and encoder lowdelay ecm.cfg.
+The parameters for encoding are as:
+• -c {config file name}
+--InputFile={input video name}
+--InputBitDepth=8
+--OutputBitDepth=8
+--OutputBitDepthC=8
+--FrameRate={frame rate}
+--DecodingRefreshType=2
+--FramesToBeEncoded={frame number}
+--SourceWidth={width}
+--SourceHeight={height}
+--IntraPeriod={intra period}
+--QP={qp}
+--Level=6.2
+--BitstreamFile={bitstream file name}
+RGB colorspace. In our experiments, the raw videos
+are stored at YUV420 format. So we convert them from
+YUV420 to RGB colorspace for testing. Following JPEG
+AI [8, 9] and [27, 28], we utilize BT.709 to perform this
+conversion, which brings higher compression ratio compared
+to the commonly-used BT.601. We test traditional codecs
+using 10-bit YUV444 as the internal colorspace and evaluate
+the final results in RGB. [27, 28] prove that, for traditional
+codecs, this brings better compression ratio than the direct
+measurement in RGB. For HM, VTM, and ECM, we utilize
+encoder lowdelay rext.cfg, encoder lowdelay vtm.cfg, and
+encoder lowdelay ecm.cfg as the config file, respectively.
+The parameters for coding are as:
+• -c {config file name}
+--InputFile={input file name}
+--InputBitDepth=10
+--OutputBitDepth=10
+--OutputBitDepthC=10
+--InputChromaFormat=444
+--FrameRate={frame rate}
+--DecodingRefreshType=2
+--FramesToBeEncoded={frame number}
+--SourceWidth={width}
+--SourceHeight={height}
+--IntraPeriod={intra period}
+--QP={qp}
+--Level=6.2
+--BitstreamFile={bitstream file name}
+B. Implementation Details
+B.1. Module Structures
+DCVC-RT follows a conditional coding manner [18, 25, 27,
+28]. While the main paper covers the core network structure,
+we additionally illustrate the architecture of the depth-wise
+convolution block (DC Block) in Fig. 8, which is not detailed
+in the manuscript. Here, WSiLU denotes a weighted SiLU
+function [14], formulated as:
+  \text { W S iLU}(x) = x \cdot \text {Sigmoid}(\alpha \cdot x) 
+(4)
+where the weighting parameter α is set to 4 by default.
+B.2. Entropy model
+DCVC-RT adopts a two-step distribution estimation scheme
+[26] to balance the coding speed and compression ratio.
+Although it results in a slight performance drop compared to
+more complex entropy models [27, 39], we adopt it since it
+enables significantly faster coding speed.
+B.3. Parallel Coding
+In practical scenarios, coding speed is influenced by both
+model inference time and entropy coding time. For DCVC-
+RT, encoding a 1080p frame typically requires around 7.8 ms
+for network inference and up to 2.6 ms for entropy coding,
+indicating that entropy coding significantly contributes to
+overall latency.
+To accelerate the process, we propose a parallel coding
+scheme, depicted in Fig. 7. Observing that certain network
+modules can be inferred independently of entropy coding,
+we conduct these modules with entropy coding in parallel.
+This parallelization does not cause severe hardware resource
+11
+
+---PAGE BREAK---
+Decode 𝑦𝑞2
+Decode 𝑧𝑞
+Decoder
+Entropy
+Model
+Entropy
+Model
+Hyper
+Dec.
+Encode 𝑦𝑞 and 𝑧𝑞 
+Decoder
+Entropy
+Model
+Hyper
+Enc.
+Encoder
+Network 
+Inference
+𝑦
+𝑧
+param
+param1
+param2
+Time
+Time
+Parallel encoding process
+Parallel decoding process
+Network
+modules
+Dependency 
+path
+Entropy coding
+Hyper
+Dec.
+Decode 𝑦𝑞1
+Entropy
+Coding
+Network 
+Inference
+Entropy
+Coding
+Feature 
+Extractor
+Feature 
+Extractor
+𝐹𝑡−1
+𝑒
+𝐹𝑡−1
+Feature 
+Extractor
+Parallel 
+Components
+Recon.
+Generation
+Figure 7. Encoding and decoding pipeline. yq and zq represent the symbols to be encoded in entropy coding. This parallel coding approach
+results in an average 12% speedup in our encoding process and a 9% speedup in our decoding process.
+Conv 1x1
+WSiLU
+Depth Conv
+Conv 1x1
+Conv 1x1
+WSiLU
+Conv 1x1
+Chunk
+Figure 8. Structures of depth-wise convolution block (DC Block).
+The formulation of WSiLU is detailed in Section. B.1. Chunk
+denotes splitting latents into two parts along the channel dimension.
+Table 4.
+Sequences used for ablation on implicit tempo-
+ral modelling.
+MCL-JCV contains 30 sequences, we de-
+note each sequence using their ID, e.g., 01 denotes sequence
+videoSRC01 1920x1080 30.
+Motion Type
+Sequences
+Large Motion
+02, 04, 05, 07, 08, 10, 11, 14, 17, 19, 20, 21, 22, 24, 26
+Small Motion
+01, 03, 06, 09, 12, 13, 15, 16, 18, 23, 25, 27, 28, 29, 30
+Scene Change
+04, 14, 19, 20, 21, 25, 26, 27, 28, 29
+contention, so the latency can be effectively reduced. For
+instance, we can perform entropy coding on the CPU without
+affecting concurrent network inference process on the GPU.
+In encoding, the feature extractor, encoder, and entropy
+model are sequentially inferred, generating symbols yq and
+zq for entropy coding and the quantized latents for decoder
+inference. Since the coding of yq and zq does not depend
+on decoder inference, these processes are parallelized. It is
+worth noting that, as the reference feature is buffered before
+reaching the reconstruction module, the reconstruction gen-
+eration module does not typically need to be inferred. In this
+case, our encoding is usually faster than decoding.
+In decoding, the entropy decoding of zq is independent
+of the feature extractor, allowing us to process them con-
+currently. Since decoding zq is fast, we only infer the first
+Figure 9. An example for rate-control on Cactus sequence.
+part of the feature extractor at this stage. After probability
+estimation, the remainder of the feature extractor is inferred
+alongside the entropy decoding of yq. Notably, we adopt a
+two-step coding scheme, where we first decode y1
+q followed
+by y2
+q. Experiments show that the decoding time of y1
+q covers
+the time needed for feature extractor inference.
+In our implementation, the parallel coding approach re-
+sults in an average 12% speedup in the encoding process
+and a 9% speedup in the decoding process, demonstrating
+its effectiveness in accelerating DCVC-RT.
+B.4. Model Integerization
+We provide a detailed explanation to better understand the
+model integerization pipeline. As mentioned in Equation 3,
+all int16 features are linearly mapped from its floating-point
+counterparts in the original model. Moreover, we also create
+linear mappings for convolution weights w and biases b. For
+12
+
+---PAGE BREAK---
+a convolution layer, we have
+  w _i &= \t e xt {round}(K_2\cdot w_f) \\ b_i &= \text {round}(K_2\cdot b_f )
+where K2 = 8192 in our implementation. Let x be the input
+feature and y be the output feature, we derive the integer
+convolution from the floating-point convolution as follows
+  y _f &= \t ext {c
+on
+v}
+( x_f, w_
+f)
+ + 
+b_
+f \\
+ \
+fr a c {y_i}{ K_1 } & = \
+text {conv}(\frac {x_i}{K_1}, \frac {w_i}{K_2}) + \frac {b_i}{K_2} \\ y_i &= \frac {\text {conv}(x_i, w_i) + b_i \cdot K_1}{K_2}
+where K1 = 512 as mentioned in Equation 3.
+The processes above are rewritten as an algorithmic work-
+flow in Algorithm 1.
+Algorithm 1 Model Integerization for a Convolution
+1: Input: Input feature x; Convolution weight wf and bias
+bf; Hyperparameters K1 and K2.
+2: Output: Output feature yi.
+3: if x is of type fp16 then
+\triangleright The input frame
+4:
+xi ←round(K1 · x).to int16()
+5: else
+\triangleright The remaining layers
+6:
+assert x is of type int16
+7:
+xi ←x
+8: end if
+9: Get int16 weight: wi = round(K2 · wf).to int16()
+10: Get int16 bias: bi = round(K2 · bf).to int16()
+11: a ←conv(xi, wi) + bi · K1
+12: Return: yi ←clip( a
+K2 , −32768, 32767)
+C. Experimental Results
+C.1. Ablation on Implicit Temporal Modelling
+In Tab. 2. of the main paper, we conduct an ablation study to
+compare explicit motion estimation with implicit temporal
+modeling under different motion conditions. Motion am-
+plitude is determined using a pretrained SEA-RAFT [52]
+model to calculate the average motion between consecutive
+frames, enabling categorization into large or small motion
+content. Scene changes are identified manually. Tab. 4 lists
+the sequences categorized by motion type.
+C.2. Results on Rate-Control
+Rate control is an essential feature for video codecs, par-
+ticularly for applications like streaming and real-time com-
+munication. By adjusting the quantization parameter (qp),
+DCVC-RT achieves effective rate-control. Fig. 9 illustrates
+Figure 10. Extend supported rate number from original 64 rates to
+128 rates using interpolation on UVG dataset.
+Table 5. Breakdown on per-module complexity for coding a 1080p
+frame on A100 GPU.
+Metric
+Encoder Decoder
+Feature
+Entropy Reconstruction
+Extractor
+Model
+Generation
+Latency
+1.4 ms
+1.4 ms
+2.4 ms
+2.4 ms
+2.2 ms
+kMACs/pixel
+30.1
+34.0
+53.0
+31.5
+56.4
+this capability, showcasing how DCVC-RT can modulate
+bitrates effectively.
+C.3. Per-Module Complexity Analysis
+Tab. 5 presents a per-module complexity analysis, detailing
+the average inference time and the corresponding MACs
+for each module. Note that since both our encoding and
+decoding pipeline both do not execute all modules (e.g.,
+reconstruction generation is skipped during encoding), the
+sum of latencies does not equal the overall latency.
+C.4. Interpolation for Arbitrary Rates
+In the proposed rate-adjustment module bank, we learn 64
+rate points to accommodate different rates within a single
+model. These modules include vectors for latent modulation
+and the factorized modules for coding z. In practice, we
+can expand the supported rate number to arbitrary larger by
+performing interpolation in the module bank. Specifically,
+to achieve a rate between the i-th and the i + 1-th module,
+we perform linear interpolation between the two vectors to
+obtain an intermediate vector for latent modulation. For the
+factorized module, we directly select the nearest module
+for probability estimation. In Fig. 10, we evaluate it to
+achieve 128 different rates (64 original and 64 interpolated)
+in a single model, and it demonstrates a very smooth quality
+13
+
+---PAGE BREAK---
+BPP / PSNR
+0.0083 / 35.80
+0.0070 / 36.36
+0.0067 / 36.50
+Original
+VTM-17.0
+DCVC-FM
+DCVC-RT
+BPP / PSNR
+0.0031 / 37.55
+0.0030 / 38.47
+0.0028 / 38.56
+Figure 11. Visual comparison with VTM [3] and DCVC-FM [28]. Best viewed when zoomed in.
+Table 6. BD-Rate (%) comparison in YUV420 colorspace. All frames with intra-period=–1.
+UVG
+MCL-JCV HEVC B HEVC C HEVC D HEVC E Average
+VTM-17.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+DCVC-FM (fp16)
+−16.8
+−8.0
+−15.4
+−30.2
+−37.5
+−20.2
+−21.3
+DCVC-RT (fp16)
+−24.0
+−14.8
+−16.6
+−21.0
+−27.3
+−22.4
+−21.0
+DCVC-RT (int16)
+−21.0
+−12.3
+−14.8
+−20.0
+−26.4
+−15.0
+−18.3
+DCVC-RT Large (fp16)
+−31.1
+−22.1
+−27.7
+−32.1
+−37.7
+−34.0
+−30.8
+DCVC-RT Large (int16) −27.7
+−19.6
+−25.9
+−31.1
+−37.0
+−24.2
+−27.6
+adjustment.
+C.5. Model Integerization Results
+Maintaining calculation consistency across different devices
+is critical for video codecs, as encoding-decoding inconsis-
+tencies can lead to errors in entropy coding and ultimately
+yield corrupted reconstructions. Fig. 12 (left) shows how
+nondeterministic floating-point calculations can accumulate
+errors over time, producing visible artifacts after around 30
+frames. In DCVC-RT, model integerization addresses this
+issue by facilitating model integerization and enforcing de-
+terministic integer calculations. As shown in Fig. 12 (right),
+this approach ensures cross-device consistency.
+Tab. 6 and 7 present the rate-distortion performance of
+DCVC-RT in int16 mode. Compared to fp16, the int16
+model exhibits only a minor BD-Rate decrease of approxi-
+mately 3%, demonstrating its practicality and effectiveness
+for real-world applications.
+C.6. Results on RGB Colorspace
+In Tab. 7, we present the BD-rate comparison for the RGB
+format under all frame intra period –1 settings. As depicted
+in the table, DCVC-RT achieves an average 14.0% bits sav-
+ing compared to VTM, which is comparable to 15.8% of
+DCVC-FM. It demonstrate the high rate-distortion perfor-
+mance of DCVC-RT.
+C.7. Visual Comparison
+To further demonstrate the superiority of DCVC-RT, we also
+present the visual comparison with VTM [3] and DCVC-
+FM [28] in Fig. 11. From these examples, we can observe
+that DCVC-RT can reconstruct frames with more details
+and clearer structures, even at lower bitrates. We offer video
+visualizations and comparisons on our project page: https:
+//dcvccodec.github.io/ .
+C.8. Rate-Distortion Curves
+In Fig. 13, we present the rate-distortion curves across all
+tested datasets. On the low-quality range, DCVC-RT demon-
+14
+
+---PAGE BREAK---
+Table 7. BD-Rate (%) comparison in RGB colorspace. All frames with intra-period=–1.
+UVG
+MCL-JCV HEVC B HEVC C HEVC D HEVC E Average
+VTM-17.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+HM-16.25
+43.2
+49.5
+49.9
+45.2
+39.9
+47.7
+45.9
+DCVC-DC
+9.2
+0.0
+14.9
+5.3
+−7.8
+87.7
+18.2
+DCVC-FM
+−11.0
+−1.3
+−11.5
+−26.6
+−33.8
+−15.4
+−16.6
+DCVC-FM (fp16)
+−10.4
+−1.1
+−11.2
+−26.5
+−33.7
+−12.1
+−15.8
+DCVC-RT (fp16)
+−17.2
+−6.8
+−11.3
+−15.8
+−21.3
+−11.4
+−14.0
+DCVC-RT (int16)
+−13.1
+−3.9
+−9.2
+−14.8
+−20.4
+−3.2
+−10.8
+DCVC-RT Large (fp16)
+−25.0
+−14.8
+−22.9
+−27.5
+−32.4
+−24.4
+−24.5
+DCVC-RT Large (int16) −20.5
+−11.9
+−20.9
+−26.5
+−31.7
+−13.5
+−20.8
+Floating-point Calculation
+Integer Calculation
+T=0
+T=12
+T=24
+T=36
+T=48
+Figure 12. An example for cross-platform coding on YachtRide
+sequence. We perform encoding on an NVIDIA A100 GPU and
+perform decoding on an RTX 2080Ti.
+strates comparable or superior performance to DCVC-FM
+and surpasses ECM, showcasing its exceptional performance.
+However, we observe a performance decline at high rates.
+This decrease can be attributed to the lightweight design of
+DCVC-RT model, which has limited capabilities compared
+to larger models. To examine this problem, we increase the
+model capacity of DCVC-RT in Section. C.9.
+Table 8. Complexity analysis of DCVC-RT-Large. All methods
+are tested in fp16 mode on an A100 GPU. The coding speed are
+evaluated on 1080p videos. BD-Rate is calculated in YUV420
+colorspace using VTM as anchor.
+Model
+Average
+MACs
+Coding Speed
+BD-Rate
+Enc.
+Dec.
+DCVC-FM
+–21.3%
+2642G
+5.0 fps
+5.9 fps
+DCVC-RT-Large
+–30.8%
+812G
+89.3 fps
+73.4 fps
+DCVC-RT
+–21.0%
+385G
+125.2 fps
+112.8 fps
+C.9. Performance for a Large Model
+In this paper, we primarily design a lightweight model to
+accelerate coding. However, DCVC-RT can be easily ex-
+tended to a larger model (DCVC-RT Large) by increasing
+the number of channels and DCB blocks. As shown in Tables
+6 and 7, the enhanced model capacity significantly improves
+compression performance. On YUV420 colorspace, Our
+large model, DCVC-RT-Large, achieves an average BD-Rate
+of −30.8%, outperforming −21.3% of the advanced large
+NVC model, DCVC-FM. On RGB colorspace, It achieves
+a BD-Rate of −24.5%, compared to DCVC-FM’s −15.8%.
+Furthermore, the performance drop at high bitrates observed
+in the small model is effectively addressed in the large model,
+confirming the conclusion in Section. C.8. For high-range
+rate points (calculated from qp = 42 to qp = 63), using
+DCVC-FM as the anchor, DCVC-RT shows a BD-Rate
+loss of 9.3% on UVG, whereas DCVC-RT-Large achieves
+a slightly better BD-Rate of −1.3%. Despite its improved
+performance, DCVC-RT-Large maintains significantly lower
+complexity than DCVC-FM, as shown in Table. 8. Thanks to
+its efficiency-driven design, it achieves an encoding speed of
+approximately 90 fps. These results underscore the superior-
+ity of DCVC-RT in the rate-distortion-complexity trade-off.
+15
+
+---PAGE BREAK---
+Figure 13. Rate-distortion curves for MCL-JCV and HEVC datasets. All frames are tested with intra-period=–1 in YUV420 colorspace. We
+show the whole quality range, relatively low quality range and relatively high quality range for each dataset.
+16
+
+---PAGE BREAK---

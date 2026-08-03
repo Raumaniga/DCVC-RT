@@ -1,0 +1,81 @@
+﻿<!DOCTYPE html>
+<html lang='vi'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Sơ đồ VCM Pipeline</title>
+    <script src='https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js'></script>
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background-color: #f8f9fa; }
+        .diagram-container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        h2 { text-align: center; color: #333; }
+    </style>
+</head>
+<body>
+
+    <div class='diagram-container'>
+        <h2>1. Giai đoạn Huấn luyện (Stage 3 - Joint Training)</h2>
+        <div class='mermaid' style='text-align: center;'>
+            graph TD
+                V[Ảnh Gốc - Uncompressed] --> |Đầu vào| DCVC
+                V --> |Đầu vào| F1
+                
+                subgraph Bộ nén Video Học sinh
+                    DCVC[DCVC-RT Codec<br/>Trainable - Mở khóa]
+                    DCVC --> |Nén| B[Cuộn Bitstream]
+                    B --> |Giải nén| R[Ảnh Giải nén]
+                end
+                
+                subgraph Mạng YOLO Giám khảo
+                    F1[YOLOv5 Extractor<br/>Frozen - Đóng băng]
+                    F1 --> |Đặc trưng r_t| L
+                    
+                    R --> F2[YOLOv5 Extractor<br/>Frozen - Đóng băng]
+                    F2 --> |Đặc trưng r_hat_t| L
+                end
+                
+                L((VCM Loss<br/>Rate + Feature MSE))
+                B -.-> |BPP| L
+                
+                L -.-> |Lan truyền ngược Gradient| OPT((Optimizer))
+                OPT -.-> |Cập nhật Trọng số| DCVC
+                
+                style DCVC fill:#d4edda,stroke:#28a745,stroke-width:2px
+                style F1 fill:#f8d7da,stroke:#dc3545,stroke-width:2px
+                style F2 fill:#f8d7da,stroke:#dc3545,stroke-width:2px
+                style L fill:#fff3cd,stroke:#ffc107,stroke-width:2px
+        </div>
+    </div>
+
+    <div class='diagram-container'>
+        <h2>2. Giai đoạn Kiểm thử (Inference - evaluate_vcm.py)</h2>
+        <div class='mermaid' style='text-align: center;'>
+            graph TD
+                V[Video Test] --> |Đầu vào| DCVC
+                
+                subgraph Bộ nén đã Tốt nghiệp
+                    DCVC[DCVC-RT Codec<br/>Frozen - Đóng băng]
+                    DCVC --> |Nén| B[Bitstream]
+                    B --> |Giải nén| R[Ảnh Giải nén]
+                end
+                
+                B -.-> |Đo lường BPP| M1((BPP))
+                
+                subgraph Đánh giá Máy nhìn
+                    R --> YOLO[YOLOv5 Detector<br/>Frozen - Đóng băng]
+                    YOLO --> |Nhận diện Bounding Box| M2((mAP 0.5))
+                end
+                
+                M1 ==> CHART[Biểu đồ R-D Curve]
+                M2 ==> CHART
+                
+                style DCVC fill:#e2e3e5,stroke:#6c757d,stroke-width:2px
+                style YOLO fill:#e2e3e5,stroke:#6c757d,stroke-width:2px
+                style CHART fill:#cce5ff,stroke:#004085,stroke-width:2px
+        </div>
+    </div>
+
+</body>
+</html>
