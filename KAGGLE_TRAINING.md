@@ -48,18 +48,29 @@ Nếu notebook không được bật Internet, tạo thêm dataset:
 └── yolov5s.pt
 ```
 
-Stage 2 còn cần original Vimeo đã tách thành chuỗi dài:
+Stage 2 dùng REDS sharp sequences:
 
 ```text
-/kaggle/input/long-vimeo/
-├── clip_0001/
-│   ├── 000001.png
-│   └── ...
-├── train.txt
-└── val.txt
+/kaggle/input/reds-dataset/
+└── REDS/
+    ├── train_sharp/
+    │   ├── 000/
+    │   │   ├── 00000000.png
+    │   │   └── ...
+    │   └── 239/
+    └── val_sharp/
+        ├── 000/
+        │   ├── 00000000.png
+        │   └── ...
+        └── 029/
 ```
 
-Mỗi sequence của Stage 2 phải có ít nhất 8 frame.
+Tải bản REDS đầy đủ gồm `train_sharp` và `val_sharp`, không dùng REDS4.
+Mỗi sequence REDS có 100 frame nên đáp ứng clip 8 frame của Stage 2.
+Nguồn tải và hướng dẫn cấu trúc:
+[REDS chính thức](https://seungjunnah.github.io/Datasets/reds.html) và
+[BasicSR Dataset Preparation](https://github.com/XPixelGroup/BasicSR/blob/master/docs/DatasetPreparation.md#reds).
+`reds-dataset` chỉ là slug minh họa; thay nó bằng slug Kaggle Dataset của bạn.
 
 ## 2. Tạo notebook và bật GPU
 
@@ -336,20 +347,39 @@ Sau khi hoàn thành:
 - `best.pt`: dùng để khởi tạo Stage 2 hoặc evaluation.
 - `epoch_*.pt`: snapshot dự phòng.
 
-## 11. Stage 2 — fine-tune original Vimeo long sequences
+## 11. Stage 2 — fine-tune REDS sharp sequences
 
 Stage 2 luôn dùng 8 frame: 1 external seed + 7 P-frame.
 
+Kiểm tra REDS trước:
+
+```python
+from pathlib import Path
+
+REDS_ROOT = Path("/kaggle/input/reds-dataset/REDS")
+train_sequences = sorted(
+    path for path in (REDS_ROOT / "train_sharp").iterdir()
+    if path.is_dir()
+)
+val_sequences = sorted(
+    path for path in (REDS_ROOT / "val_sharp").iterdir()
+    if path.is_dir()
+)
+
+assert len(train_sequences) == 240
+assert len(val_sequences) == 30
+assert len(list(train_sequences[0].glob("*.png"))) == 100
+print("REDS check=PASS")
+```
+
 ```bash
 !python train_vcm_final.py \
-  --training-stage long8 \
-  --data-dir /kaggle/input/long-vimeo \
-  --train-list /kaggle/input/long-vimeo/train.txt \
-  --val-dir /kaggle/input/long-vimeo \
-  --val-list /kaggle/input/long-vimeo/val.txt \
+  --training-stage reds8 \
+  --data-dir /kaggle/input/reds-dataset/REDS/train_sharp \
+  --val-dir /kaggle/input/reds-dataset/REDS/val_sharp \
   --samples-per-sequence 8 \
   --video-init /kaggle/working/checkpoints/vcm_vimeo7/best.pt \
-  --checkpoint-dir /kaggle/working/checkpoints/vcm_long8 \
+  --checkpoint-dir /kaggle/working/checkpoints/vcm_reds8 \
   --crop-size 128 \
   --batch-size 1 \
   --num-workers 2 \
@@ -365,14 +395,12 @@ Stage 2 resume:
 
 ```bash
 !python train_vcm_final.py \
-  --training-stage long8 \
-  --data-dir /kaggle/input/long-vimeo \
-  --train-list /kaggle/input/long-vimeo/train.txt \
-  --val-dir /kaggle/input/long-vimeo \
-  --val-list /kaggle/input/long-vimeo/val.txt \
+  --training-stage reds8 \
+  --data-dir /kaggle/input/reds-dataset/REDS/train_sharp \
+  --val-dir /kaggle/input/reds-dataset/REDS/val_sharp \
   --samples-per-sequence 8 \
-  --resume /kaggle/working/checkpoints/vcm_long8/latest.pt \
-  --checkpoint-dir /kaggle/working/checkpoints/vcm_long8 \
+  --resume /kaggle/working/checkpoints/vcm_reds8/latest.pt \
+  --checkpoint-dir /kaggle/working/checkpoints/vcm_reds8 \
   --crop-size 128 \
   --batch-size 1 \
   --num-workers 2 \
@@ -381,7 +409,8 @@ Stage 2 resume:
 ```
 
 Không dùng `--resume` từ Stage 1 cho Stage 2. Chuyển stage phải dùng
-`--video-init .../vcm_vimeo7/best.pt`.
+`--video-init .../vcm_vimeo7/best.pt`. Tên stage cũ `long8` vẫn được chấp nhận
+như alias để resume checkpoint cũ, nhưng run mới nên dùng `reds8`.
 
 ## 12. Xử lý CUDA OOM
 

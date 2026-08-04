@@ -1,7 +1,7 @@
-"""Train the video-only DCVC-RT VCM codec with the paper's video protocol.
+"""Train the video-only DCVC-RT VCM codec with a hierarchical video protocol.
 
-Stage ``vimeo7`` trains on Vimeo-90K septuplets. Stage ``long8`` fine-tunes
-that model on processed original Vimeo videos using eight-picture clips.
+Stage ``vimeo7`` trains on Vimeo-90K septuplets. Stage ``reds8`` fine-tunes
+that model on REDS sharp sequences using eight-picture clips.
 Frame 0 is an external reference seed and all later frames are coded by DMC.
 The only trainable parameters are DMC; distortion is machine Feature MSE.
 """
@@ -44,6 +44,7 @@ METRICS = (
     "base_qp",
     "coding_qp",
 )
+TRAINING_STAGE_ALIASES = {"long8": "reds8"}
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,8 @@ class RestoredTrainingState:
 
 def get_training_schedule(stage: str) -> TrainingSchedule:
     """Return the published hierarchy truncated to the active clip length."""
-    frame_counts = {"vimeo7": 7, "long8": 8}
+    stage = TRAINING_STAGE_ALIASES.get(stage, stage)
+    frame_counts = {"vimeo7": 7, "reds8": 8}
     if stage not in frame_counts:
         raise ValueError(f"Unknown training stage: {stage}")
     num_frames = frame_counts[stage]
@@ -180,7 +182,7 @@ def run_gop(
     schedule = get_training_schedule(args.training_stage)
     if frames.shape[1] < 2:
         raise ValueError("A clip needs one seed frame and at least one coded P-frame")
-    if args.training_stage == "long8" and frames.shape[1] != schedule.num_frames:
+    if schedule.name == "reds8" and frames.shape[1] != schedule.num_frames:
         raise ValueError(
             f"Stage {schedule.name} requires {schedule.num_frames} pictures, "
             f"but received {frames.shape[1]}"
@@ -343,7 +345,8 @@ def restore(
             "Load its DMC weights with --video-init instead."
         )
     saved_stage = checkpoint.get("training_stage")
-    if saved_stage is not None and saved_stage != training_stage:
+    normalized_saved_stage = TRAINING_STAGE_ALIASES.get(saved_stage, saved_stage)
+    if normalized_saved_stage is not None and normalized_saved_stage != training_stage:
         raise ValueError(
             f"Checkpoint stage is {saved_stage}, but --training-stage is "
             f"{training_stage}. Use --video-init for a stage transition."
@@ -437,6 +440,10 @@ def prune_periodic_checkpoints(directory: Path, keep: int) -> None:
 
 
 def train(args: argparse.Namespace):
+    args.training_stage = TRAINING_STAGE_ALIASES.get(
+        args.training_stage,
+        args.training_stage,
+    )
     if args.crop_size % 16:
         raise ValueError("crop_size must be divisible by 16 for DCVC-RT")
     if args.weight_decay < 0:
@@ -460,10 +467,10 @@ def train(args: argparse.Namespace):
     schedule = get_training_schedule(args.training_stage)
     if args.resume and args.video_init:
         raise ValueError("Use --resume or --video-init, not both")
-    if args.training_stage == "long8" and not (args.video_init or args.resume):
+    if args.training_stage == "reds8" and not (args.video_init or args.resume):
         raise ValueError(
-            "Stage long8 is fine-tuning and requires the Vimeo7 checkpoint via "
-            "--video-init (or --resume for an interrupted long8 run)"
+            "Stage reds8 is fine-tuning and requires the Vimeo7 checkpoint via "
+            "--video-init (or --resume for an interrupted reds8 run)"
         )
     interpolate_lambda(0, args.lambda_min, args.lambda_max)
     get_epoch_num_frames(args, 1)
@@ -673,14 +680,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--training-stage",
-        choices=("vimeo7", "long8"),
+        choices=("vimeo7", "reds8", "long8"),
         default="vimeo7",
-        help="vimeo7: initial Vimeo-90K training; long8: long-Vimeo fine-tuning",
+        help=(
+            "vimeo7: initial Vimeo-90K training; reds8: REDS sharp-sequence "
+            "fine-tuning; long8 is a deprecated alias for reds8"
+        ),
     )
     parser.add_argument(
         "--data-dir",
         required=True,
-        help="Vimeo-90K sequences directory or processed long-Vimeo frame root",
+        help="Vimeo-90K sequences directory or REDS train_sharp/val_sharp root",
     )
     parser.add_argument("--val-dir", help="Optional validation frame-sequence directory")
     parser.add_argument("--train-list", help="Sequence list relative to data-dir (or an absolute path)")

@@ -1,7 +1,7 @@
 """Dataset loader for the two video-training stages used by DCVC-RT.
 
 It supports both standard Vimeo-90K septuplets (seven frames per directory)
-and processed original Vimeo videos containing longer frame sequences.
+and REDS sharp sequences containing 100 consecutive frames per directory.
 """
 
 from __future__ import annotations

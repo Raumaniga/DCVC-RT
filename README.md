@@ -38,6 +38,11 @@ công bố hai bước dữ liệu:
 1. Train bằng các sequence 7 frame của Vimeo-90K.
 2. Fine-tune bằng video Vimeo gốc đã xử lý thành sequence dài.
 
+Dự án giữ cách train hai bước nhưng thay dữ liệu ở bước 2 bằng REDS
+`train_sharp`/`val_sharp`, do original Vimeo không còn được phát hành thành một
+gói ổn định. Vì vậy Stage 2 là protocol thay thế, không phải tái lập dataset
+nguyên bản của paper.
+
 Trong mỗi iteration, `QP_base` được lấy ngẫu nhiên trong `[0, 63]`. Lịch phân cấp
 cho nhóm 8 ảnh là:
 
@@ -61,7 +66,7 @@ Loss_t = BPP_t + lambda(QP_base) * w_t * D_machine_t
 ```
 
 Frame 0 là reference seed từ bên ngoài, không nén và không tính loss. Stage
-`vimeo7` dùng 7 vị trí đầu của lịch và mã hóa 6 P-frame. Stage `long8` dùng đủ
+`vimeo7` dùng 7 vị trí đầu của lịch và mã hóa 6 P-frame. Stage `reds8` dùng đủ
 8 vị trí và mã hóa 7 P-frame. Sau khi lấy trung bình loss các P-frame, chương
 trình backpropagate một lần, clip gradient và cập nhật DMC bằng AdamW.
 
@@ -88,8 +93,8 @@ trọng số thông thường; các tham số quantization `q_*`, bias và tham 
 weight decay bằng 0 để không làm lệch rate-control.
 
 Mã train DCVC-RT chính thức chưa được phát hành; paper không công bố số epoch,
-batch size, learning rate hay cách chia long-video cụ thể. Các giá trị đó trong
-script là cấu hình có thể điều chỉnh, không phải hyperparameter chính thức.
+batch size hay learning rate cụ thể. Các giá trị đó trong script là cấu hình có
+thể điều chỉnh, không phải hyperparameter chính thức.
 
 ## Dataset stage 1: Vimeo-90K Septuplet
 
@@ -112,40 +117,31 @@ vimeo_septuplet/
 
 Không cần nhãn detection để train vì teacher tự sinh target feature từ ảnh gốc.
 
-## Dataset stage 2: original Vimeo long sequences
+## Dataset stage 2: REDS sharp sequences
 
-Paper dùng các video từ danh sách
-[original_vimeo_links.txt](https://github.com/anchen1011/toflow/blob/master/data/original_vimeo_links.txt)
-và xử lý chúng thành sequence dài theo DCVC-FM. Nhiều video có thể không còn
-truy cập được hoặc bị giới hạn bản quyền; repository không tự động tải chúng.
-Chỉ sử dụng video mà bạn có quyền truy cập.
-
-Sau khi có các file video, giải mã mỗi video thành một thư mục frame liên tiếp,
-ví dụ:
-
-```powershell
-New-Item -ItemType Directory D:\data\long_vimeo\clip_0001
-ffmpeg -i D:\videos\clip_0001.mp4 -vsync 0 D:\data\long_vimeo\clip_0001\%06d.png
-```
-
-Cấu trúc đầu ra:
+Dự án dùng [REDS](https://seungjunnah.github.io/Datasets/reds.html) làm dataset
+thay thế công khai cho original Vimeo. REDS có 240 sequence train và 30 sequence
+validation; mỗi sequence chứa 100 frame RGB 720p liên tiếp. Chỉ cần tải
+`train_sharp` và `val_sharp`; không dùng bản blur, low-resolution hoặc REDS4.
 
 ```text
-long_vimeo/
-├── clip_0001/
-│   ├── 000001.png
-│   ├── 000002.png
-│   └── ...
-├── clip_0002/
-│   └── ...
-├── train.txt
-└── val.txt
+REDS/
+├── train_sharp/
+│   ├── 000/
+│   │   ├── 00000000.png
+│   │   └── ...
+│   └── 239/
+└── val_sharp/
+    ├── 000/
+    │   ├── 00000000.png
+    │   └── ...
+    └── 029/
 ```
 
-Mỗi sequence phải có ít nhất 8 frame. Mỗi dòng trong list là đường dẫn sequence
-tương đối với `--data-dir`, chẳng hạn `clip_0001`. Nếu không truyền list, loader
-tự tìm các thư mục chứa ảnh. `--samples-per-sequence` cho phép lấy nhiều temporal
-crop ngẫu nhiên từ mỗi video dài trong một epoch.
+Loader tự tìm các thư mục sequence nên REDS không cần `train.txt`/`val.txt`.
+`--samples-per-sequence 8` lấy tám temporal crop ngẫu nhiên từ mỗi sequence
+trong một epoch. Đây là thay thế thực dụng cho dự án, không phải dataset
+fine-tune nguyên bản được bài DCVC-RT công bố.
 
 ## Cài đặt
 
@@ -185,31 +181,29 @@ python train_vcm_final.py `
 `--video-init` là tùy chọn. Dùng nó để machine-oriented fine-tune từ checkpoint
 video DCVC-RT; bỏ tham số này nếu muốn train DMC từ khởi tạo ngẫu nhiên.
 
-Stage 2, khởi tạo từ kết quả tốt nhất của stage 1 và fine-tune trên sequence dài:
+Stage 2, khởi tạo từ kết quả tốt nhất của stage 1 và fine-tune trên REDS:
 
 ```powershell
 python train_vcm_final.py `
-  --training-stage long8 `
-  --data-dir D:\data\long_vimeo `
-  --train-list train.txt `
-  --val-dir D:\data\long_vimeo `
-  --val-list val.txt `
+  --training-stage reds8 `
+  --data-dir D:\data\REDS\train_sharp `
+  --val-dir D:\data\REDS\val_sharp `
   --samples-per-sequence 8 `
   --video-init checkpoints\vcm_vimeo7\best.pt `
-  --checkpoint-dir checkpoints\vcm_long8
+  --checkpoint-dir checkpoints\vcm_reds8
 ```
 
-Script bắt buộc stage `long8` phải có `--video-init` hoặc `--resume` để tránh
-vô tình train chuỗi dài từ đầu, sai thứ tự của paper.
+Script bắt buộc stage `reds8` phải có `--video-init` hoặc `--resume` để tránh
+vô tình train chuỗi dài từ đầu.
 
 Để tiếp tục đúng một stage sau khi bị dừng, dùng `--resume` thay vì
 `--video-init`:
 
 ```powershell
 python train_vcm_final.py `
-  --training-stage long8 `
-  --data-dir D:\data\long_vimeo `
-  --resume checkpoints\vcm_long8\latest.pt
+  --training-stage reds8 `
+  --data-dir D:\data\REDS\train_sharp `
+  --resume checkpoints\vcm_reds8\latest.pt
 ```
 
 Checkpoint tạo trước khi dự án chuyển sang AdamW không có optimizer state tương
@@ -284,7 +278,7 @@ python evaluate_vcm.py --mode codec `
 python evaluate_vcm.py --mode codec `
   --data-dir D:\data\vcm_eval `
   --dataset-manifest manifest.json `
-  --video-ckpt checkpoints\vcm_long8\best.pt `
+  --video-ckpt checkpoints\vcm_reds8\best.pt `
   --method-name dcvc_rt_vcm `
   --qps 0 21 42 63
 ```
