@@ -1,9 +1,7 @@
-"""Dataset loader for contiguous frame folders.
+"""Dataset loader for the two video-training stages used by DCVC-RT.
 
-The DCVC-RT hierarchical training schedule uses groups of eight pictures.
-Standard Vimeo-90K septuplets only contain seven pictures, so exact training
-requires the longer Vimeo clips described by DCVC-FM/DCVC-RT (or another
-frame-folder dataset with at least eight contiguous frames per sequence).
+It supports both standard Vimeo-90K septuplets (seven frames per directory)
+and processed original Vimeo videos containing longer frame sequences.
 """
 
 from __future__ import annotations
@@ -44,16 +42,21 @@ class VideoSequenceDataset(Dataset):
         crop_size: int = 256,
         num_frames: int = 8,
         training: bool = True,
+        samples_per_sequence: int = 1,
     ):
         self.root_dir = Path(root_dir)
         self.crop_size = int(crop_size)
         self.num_frames = int(num_frames)
+        self.max_num_frames = self.num_frames
         self.training = bool(training)
+        self.samples_per_sequence = int(samples_per_sequence)
 
         if not self.root_dir.is_dir():
             raise FileNotFoundError(f"Video sequences directory not found: {self.root_dir}")
         if self.num_frames < 2:
             raise ValueError("num_frames must contain one reference seed and at least one P-frame")
+        if self.samples_per_sequence < 1:
+            raise ValueError("samples_per_sequence must be at least 1")
 
         list_path = self._resolve_list_path(list_file)
         if list_path is not None:
@@ -73,8 +76,7 @@ class VideoSequenceDataset(Dataset):
         if first_count < self.num_frames:
             raise ValueError(
                 f"{first_sequence} contains {first_count} frames, but the clip requires "
-                f"{self.num_frames}. Standard Vimeo-90K septuplets have only 7 frames; "
-                "use processed long Vimeo clips for the 8-picture DCVC-RT schedule."
+                f"{self.num_frames}."
             )
 
     def _resolve_list_path(self, list_file: str | Path | None) -> Path | None:
@@ -112,10 +114,20 @@ class VideoSequenceDataset(Dataset):
             return image.convert("RGB")
 
     def __len__(self) -> int:
-        return len(self.sequence_ids)
+        return len(self.sequence_ids) * self.samples_per_sequence
+
+    def set_num_frames(self, num_frames: int):
+        """Change the temporal crop length without rebuilding the DataLoader."""
+        num_frames = int(num_frames)
+        if not 2 <= num_frames <= self.max_num_frames:
+            raise ValueError(
+                f"num_frames must be in [2, {self.max_num_frames}], got {num_frames}"
+            )
+        self.num_frames = num_frames
 
     def __getitem__(self, index: int) -> torch.Tensor:
-        sequence_dir = self.root_dir / self.sequence_ids[index]
+        sequence_index = index % len(self.sequence_ids)
+        sequence_dir = self.root_dir / self.sequence_ids[sequence_index]
         frame_paths = self._frame_paths(sequence_dir)
         if len(frame_paths) < self.num_frames:
             raise ValueError(

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -25,6 +27,8 @@ class VCMLoss(nn.Module):
         model_name: str = "yolov5s",
         feature_layer_indices: Sequence[int] = DEFAULT_FEATURE_LAYER_INDICES,
         feature_layer_weights: Sequence[float] | None = None,
+        yolov5_repository: str | Path | None = None,
+        yolov5_weights: str | Path | None = None,
     ):
         super().__init__()
         self.feature_layer_indices = tuple(int(index) for index in feature_layer_indices)
@@ -46,11 +50,10 @@ class VCMLoss(nn.Module):
         self.teacher_extractor = YOLOv5FeatureExtractor(
             model_name,
             self.feature_layer_indices,
+            repository=yolov5_repository,
+            weights=yolov5_weights,
         )
-        self.reconstruction_extractor = YOLOv5FeatureExtractor(
-            model_name,
-            self.feature_layer_indices,
-        )
+        self.reconstruction_extractor = copy.deepcopy(self.teacher_extractor)
 
     def train(self, mode: bool = True):
         super().train(mode)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -29,14 +30,44 @@ def _allow_legacy_yolov5_checkpoint_loading():
         torch.load = original_load
 
 
-def load_yolov5(model_name: str = "yolov5s"):
-    """Load the pinned YOLOv5 implementation used for training and evaluation."""
+def load_yolov5(
+    model_name: str = "yolov5s",
+    repository: str | Path | None = None,
+    weights: str | Path | None = None,
+):
+    """Load pinned YOLOv5 v7 online or from Kaggle/local files.
+
+    When ``repository`` is provided, it must point to a local YOLOv5 v7
+    checkout. ``weights`` may point to a local ``.pt`` file in either mode.
+    """
+    repository_path = Path(repository).expanduser() if repository else None
+    weights_path = Path(weights).expanduser() if weights else None
+    if repository_path is not None and not repository_path.is_dir():
+        raise FileNotFoundError(f"YOLOv5 repository not found: {repository_path}")
+    if weights_path is not None and not weights_path.is_file():
+        raise FileNotFoundError(f"YOLOv5 weights not found: {weights_path}")
+
+    source = "local" if repository_path is not None else "github"
+    repo_or_dir = (
+        str(repository_path)
+        if repository_path is not None
+        else "ultralytics/yolov5:v7.0"
+    )
+    entrypoint = "custom" if weights_path is not None else model_name
+    load_kwargs = {
+        "source": source,
+        "trust_repo": True,
+    }
+    if weights_path is not None:
+        load_kwargs["path"] = str(weights_path)
+    else:
+        load_kwargs["pretrained"] = True
+
     with _allow_legacy_yolov5_checkpoint_loading():
         return torch.hub.load(
-            "ultralytics/yolov5:v7.0",
-            model_name,
-            pretrained=True,
-            trust_repo=True,
+            repo_or_dir,
+            entrypoint,
+            **load_kwargs,
         )
 
 
@@ -57,6 +88,8 @@ class YOLOv5FeatureExtractor(nn.Module):
         self,
         model_name: str = "yolov5s",
         feature_layer_indices: Sequence[int] = DEFAULT_FEATURE_LAYER_INDICES,
+        repository: str | Path | None = None,
+        weights: str | Path | None = None,
     ):
         super().__init__()
         indices = tuple(int(index) for index in feature_layer_indices)
@@ -75,7 +108,7 @@ class YOLOv5FeatureExtractor(nn.Module):
                 "skip connections and retain substantially more training memory"
             )
 
-        yolo = load_yolov5(model_name)
+        yolo = load_yolov5(model_name, repository=repository, weights=weights)
         layers = list(yolo.model.model.model.children())
         if indices[-1] >= len(layers):
             raise ValueError(
