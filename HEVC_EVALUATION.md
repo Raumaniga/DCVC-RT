@@ -69,6 +69,7 @@ python evaluate_hevc.py \
   --qps 22 27 32 37 \
   --method-name "HEVC HM-16.22 LDP" \
   --detector-size 640 \
+  --detector-batch-size 16 \
   --confidence-threshold 0.001 \
   --nms-iou-threshold 0.6 \
   --max-detections 300 \

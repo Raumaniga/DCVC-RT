@@ -329,41 +329,68 @@ def evaluate_reconstructions(
     first_image_id: int,
     protocol_key: str,
     progress_label: str,
+    detector_batch_size: int,
 ) -> int:
     first_frame = 0 if protocol_key == "all-frames" else 1
     image_id = first_image_id
-    frames = range(first_frame, sequence.frame_count)
-    for frame_index in tqdm(
-        frames,
+    if detector_batch_size < 1:
+        raise ValueError("detector_batch_size must be positive")
+
+    with tqdm(
         total=sequence.frame_count - first_frame,
         desc=progress_label,
         unit="frame",
         leave=False,
-    ):
-        detections = detector(
-            [as_yolo_image(reconstructed_frames[frame_index])],
-            size=detector_size,
-        ).xyxy[0].detach().cpu()
-        target_boxes, target_classes = dataset.load_ground_truth(
-            sequence.label_paths[frame_index],
-            sequence.width,
-            sequence.height,
-        )
-        if len(target_classes) and int(target_classes.max()) >= len(detector.names):
-            raise ValueError(
-                f"{sequence.label_paths[frame_index]} contains class "
-                f"{int(target_classes.max())}, but the task model only "
-                f"defines {len(detector.names)} classes"
+    ) as frame_progress:
+        for batch_start in range(
+            first_frame, sequence.frame_count, detector_batch_size
+        ):
+            batch_indices = list(
+                range(
+                    batch_start,
+                    min(batch_start + detector_batch_size, sequence.frame_count),
+                )
             )
-        evaluator.add(
-            image_id=image_id,
-            predicted_boxes=detections[:, :4],
-            predicted_scores=detections[:, 4],
-            predicted_classes=detections[:, 5].long(),
-            target_boxes=target_boxes,
-            target_classes=target_classes,
-        )
-        image_id += 1
+            # AutoShape accepts a list of RGB arrays and performs independent
+            # letterboxing/NMS per image. Batch inference changes throughput,
+            # not the evaluated frames, labels, or codec rate.
+            batch_detections = detector(
+                [as_yolo_image(reconstructed_frames[index]) for index in batch_indices],
+                size=detector_size,
+            ).xyxy
+            if len(batch_detections) != len(batch_indices):
+                raise RuntimeError(
+                    f"YOLO returned {len(batch_detections)} outputs for "
+                    f"a batch of {len(batch_indices)} frames"
+                )
+            for frame_index, detections in zip(
+                batch_indices, batch_detections, strict=True
+            ):
+                target_boxes, target_classes = dataset.load_ground_truth(
+                    sequence.label_paths[frame_index],
+                    sequence.width,
+                    sequence.height,
+                )
+                if (
+                    len(target_classes)
+                    and int(target_classes.max()) >= len(detector.names)
+                ):
+                    raise ValueError(
+                        f"{sequence.label_paths[frame_index]} contains class "
+                        f"{int(target_classes.max())}, but the task model only "
+                        f"defines {len(detector.names)} classes"
+                    )
+                detections = detections.detach().cpu()
+                evaluator.add(
+                    image_id=image_id,
+                    predicted_boxes=detections[:, :4],
+                    predicted_scores=detections[:, 4],
+                    predicted_classes=detections[:, 5].long(),
+                    target_boxes=target_boxes,
+                    target_classes=target_classes,
+                )
+                image_id += 1
+            frame_progress.update(len(batch_indices))
     return image_id
 
 
@@ -498,6 +525,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     next_image_id,
                     args.protocol,
                     f"{args.method_name}: QP {qp} YOLO {sequence.name}",
+                    args.detector_batch_size,
                 )
                 if args.save_reconstructions:
                     destination = (
@@ -634,6 +662,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolov5-repo")
     parser.add_argument("--yolov5-weights")
     parser.add_argument("--detector-size", type=int, default=640)
+    parser.add_argument(
+        "--detector-batch-size",
+        type=int,
+        default=16,
+        help="YOLO inference frames per GPU batch; changes speed only (default: 16)",
+    )
     parser.add_argument("--confidence-threshold", type=float, default=0.001)
     parser.add_argument("--nms-iou-threshold", type=float, default=0.6)
     parser.add_argument("--max-detections", type=int, default=300)
