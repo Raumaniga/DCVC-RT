@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 
 EXTERNAL_SEED_PROTOCOL = (
     "external seed excluded; all coded P-frames included"
@@ -21,7 +23,7 @@ def _relative_name(path: Path, root_dir: Path) -> str:
         return path.resolve().as_posix()
 
 
-def evaluation_id(dataset, sequences=None) -> str:
+def evaluation_id(dataset, sequences=None, progress_description: str | None = None) -> str:
     """Fingerprint the exact sequence/frame/label set used by every codec.
 
     Frame contents are represented by their relative paths and byte sizes to
@@ -31,6 +33,12 @@ def evaluation_id(dataset, sequences=None) -> str:
     digest = hashlib.sha256()
     digest.update(b"dcvc-rt-vcm-evaluation-v1\0")
     selected_sequences = list(dataset if sequences is None else sequences)
+    total_frames = sum(sequence.frame_count for sequence in selected_sequences)
+    progress = (
+        tqdm(total=total_frames, desc=progress_description, unit="frame")
+        if progress_description
+        else None
+    )
     for sequence in selected_sequences:
         sequence_metadata = {
             "name": sequence.name,
@@ -67,6 +75,10 @@ def evaluation_id(dataset, sequences=None) -> str:
             digest.update(b"\0")
             digest.update(label_path.read_bytes())
             digest.update(b"\0")
+            if progress is not None:
+                progress.update(1)
+    if progress is not None:
+        progress.close()
     return f"sha256:{digest.hexdigest()}"
 
 

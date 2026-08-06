@@ -421,7 +421,11 @@ def checkpoint_identity(
 ) -> dict:
     """Return the inputs that must agree before an evaluation can resume."""
     return {
-        "evaluation_id": evaluation_id(dataset, sequences),
+        "evaluation_id": evaluation_id(
+            dataset,
+            sequences,
+            progress_description="Preparing HEVC evaluation identity",
+        ),
         "qps": list(args.qps),
         "protocol": args.protocol,
         "bit_depth": args.bit_depth,
