@@ -16,6 +16,7 @@ Use ``--protocol all-frames`` to count the complete HEVC bitstream instead.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -41,6 +42,7 @@ from src.utils.vcm_eval_dataset import AnnotatedVideoDataset, VideoSequence
 
 
 RATE_POINT_COUNT = 4
+PROGRESS_SCHEMA_VERSION = 1
 PROTOCOLS = {
     "conditional-pframes": EXTERNAL_SEED_PROTOCOL,
     "all-frames": ALL_FRAMES_PROTOCOL,
@@ -411,6 +413,57 @@ def aggregate_rate(records: list[dict]) -> dict[str, float | int]:
     }
 
 
+def checkpoint_identity(
+    args: argparse.Namespace,
+    dataset: AnnotatedVideoDataset,
+    sequences: list[VideoSequence],
+    config: Path,
+) -> dict:
+    """Return the inputs that must agree before an evaluation can resume."""
+    return {
+        "evaluation_id": evaluation_id(dataset, sequences),
+        "qps": list(args.qps),
+        "protocol": args.protocol,
+        "bit_depth": args.bit_depth,
+        "hm_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+        "hm_extra_arg": list(args.hm_extra_arg),
+        "task_model": args.task_model,
+        "detector_size": args.detector_size,
+        "confidence_threshold": args.confidence_threshold,
+        "nms_iou_threshold": args.nms_iou_threshold,
+        "max_detections": args.max_detections,
+        "yolov5_weights": str(args.yolov5_weights or "torch-hub-default"),
+    }
+
+
+def save_progress_checkpoint(path: Path, state: dict) -> None:
+    """Atomically save progress after each finished sequence.
+
+    DetectionMAP contains the raw predictions/labels required to calculate a
+    dataset-level mAP after a resumed run, so it is intentionally saved along
+    with the completed bitrate records.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, temporary)
+    temporary.replace(path)
+
+
+def load_progress_checkpoint(path: Path, identity: dict) -> dict:
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict) or state.get("schema_version") != PROGRESS_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported HEVC progress checkpoint: {path}. Remove it and restart."
+        )
+    if state.get("identity") != identity:
+        raise RuntimeError(
+            "The HEVC progress checkpoint was made with a different dataset, "
+            "QP list, HM config, protocol, or detector configuration. "
+            "Choose a new --progress-checkpoint or restart without --resume."
+        )
+    return state
+
+
 def evaluate_hevc(args: argparse.Namespace) -> None:
     if len(set(args.qps)) != RATE_POINT_COUNT:
         raise ValueError("Exactly four distinct HEVC QPs are required")
@@ -454,12 +507,65 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
     if work_parent is not None:
         work_parent.mkdir(parents=True, exist_ok=True)
 
-    points = []
+    identity = checkpoint_identity(args, dataset, sequences, config)
+    progress_path = (
+        Path(args.progress_checkpoint)
+        if args.progress_checkpoint
+        else Path(args.output_dir) / f"{method_name}_progress.pt"
+    )
+    state = {
+        "schema_version": PROGRESS_SCHEMA_VERSION,
+        "identity": identity,
+        "points": [],
+        "active": None,
+    }
+    if args.resume:
+        if progress_path.is_file():
+            state = load_progress_checkpoint(progress_path, identity)
+            print(f"Resuming HEVC evaluation from {progress_path}")
+        else:
+            print(f"No HEVC progress checkpoint at {progress_path}; starting fresh")
+
+    points = list(state["points"])
+    completed_qps = {int(point["base_qp"]) for point in points}
     for qp in args.qps:
-        evaluator = DetectionMAP()
-        records = []
-        next_image_id = 0
-        progress = tqdm(sequences, desc=f"{args.method_name}: HM QP {qp}")
+        if qp in completed_qps:
+            print(f"{args.method_name}: HM QP {qp} already complete; skipping")
+            continue
+
+        active = state.get("active")
+        if active is not None and int(active["qp"]) == qp:
+            evaluator = active["evaluator"]
+            records = active["records"]
+            next_image_id = int(active["next_image_id"])
+            completed_names = set(active["completed_sequence_names"])
+            print(
+                f"{args.method_name}: resuming QP {qp}; "
+                f"{len(completed_names)}/{len(sequences)} sequences complete"
+            )
+        else:
+            evaluator = DetectionMAP()
+            records = []
+            next_image_id = 0
+            completed_names = set()
+            state["active"] = {
+                "qp": qp,
+                "evaluator": evaluator,
+                "records": records,
+                "next_image_id": next_image_id,
+                "completed_sequence_names": [],
+            }
+            save_progress_checkpoint(progress_path, state)
+
+        pending_sequences = [
+            sequence for sequence in sequences if sequence.name not in completed_names
+        ]
+        progress = tqdm(
+            pending_sequences,
+            total=len(sequences),
+            initial=len(completed_names),
+            desc=f"{args.method_name}: HM QP {qp}",
+        )
         for sequence in progress:
             with tempfile.TemporaryDirectory(
                 prefix=f"hevc_{safe_name(sequence.name)}_",
@@ -567,6 +673,18 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                         "coded_frames": coded_frames,
                     }
                 )
+                completed_names.add(sequence.name)
+                # The current sequence has completed encoding, decoding and
+                # mAP evaluation. If Colab stops after this point, --resume
+                # reuses it and only starts the next sequence.
+                state["active"] = {
+                    "qp": qp,
+                    "evaluator": evaluator,
+                    "records": records,
+                    "next_image_id": next_image_id,
+                    "completed_sequence_names": sorted(completed_names),
+                }
+                save_progress_checkpoint(progress_path, state)
 
         points.append(
             {
@@ -576,6 +694,10 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                 "sequences": records,
             }
         )
+        completed_qps.add(qp)
+        state["points"] = points
+        state["active"] = None
+        save_progress_checkpoint(progress_path, state)
 
     protocol = PROTOCOLS[args.protocol]
     rate_source = (
@@ -621,6 +743,8 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
     output_path = Path(args.output_dir) / f"{method_name}_results.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    if progress_path.is_file() and not args.keep_progress_checkpoint:
+        progress_path.unlink()
     print(f"Saved HEVC actual-rate mAP results to {output_path}")
 
 
@@ -657,6 +781,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--method-name", default="HEVC HM Low-Delay P")
     parser.add_argument("--max-sequences", type=int)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the automatic per-sequence HEVC progress checkpoint",
+    )
+    parser.add_argument(
+        "--progress-checkpoint",
+        help="Path for HEVC progress state (default: <output-dir>/<method>_progress.pt)",
+    )
+    parser.add_argument(
+        "--keep-progress-checkpoint",
+        action="store_true",
+        help="Keep the progress checkpoint after a successful final result",
+    )
     parser.add_argument("--cuda-index", type=int, default=0)
     parser.add_argument("--task-model", default="yolov5s")
     parser.add_argument("--yolov5-repo")

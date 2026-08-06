@@ -76,6 +76,12 @@ python evaluate_hevc.py \
   --output-dir output/hevc_evaluation
 ```
 
+The evaluator saves an automatic progress checkpoint after every completely
+evaluated sequence (encoding, decoding, and mAP). If a Colab session ends,
+repeat the identical command with `--resume`; at most the sequence active at
+the interruption is re-run. Keep `--output-dir`, `--bitstream-dir`, and
+`--encoder-log-dir` on Google Drive if the runtime itself may be reset.
+
 For offline YOLOv5, add:
 
 ```bash
