@@ -56,6 +56,20 @@ METRIC_ALIASES = {
         "mAP",
     ),
 }
+FRAME_COUNT_ALIASES = ("evaluated_frames", "coded_frames")
+SHARED_METADATA_KEYS = (
+    "evaluation_id",
+    "task_model",
+    "protocol",
+    "ground_truth",
+    "detector_config",
+)
+REQUIRED_METADATA_KEYS = (
+    "method",
+    "codec",
+    "rate_source",
+    *SHARED_METADATA_KEYS,
+)
 
 
 def _read_number(
@@ -87,6 +101,25 @@ def _point_label(point: dict[str, Any], point_index: int) -> str:
     return f"R{point_index + 1}"
 
 
+def _read_frame_count(
+    point: dict[str, Any],
+    path: Path,
+    point_index: int,
+) -> int:
+    value = _read_number(
+        point,
+        FRAME_COUNT_ALIASES,
+        path,
+        point_index,
+    )
+    if value <= 0 or int(value) != value:
+        raise ValueError(
+            f"{path}: point {point_index} evaluated frame count "
+            "must be a positive integer"
+        )
+    return int(value)
+
+
 def load_method_results(
     path: str | Path,
     fallback_method: str,
@@ -95,6 +128,16 @@ def load_method_results(
 ) -> dict[str, Any]:
     result_path = Path(path)
     data = json.loads(result_path.read_text(encoding="utf-8"))
+    missing_metadata = [
+        key
+        for key in REQUIRED_METADATA_KEYS
+        if data.get(key) is None
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{result_path} is missing required evaluation metadata: "
+            f"{missing_metadata}"
+        )
     points = data.get("points")
     if not isinstance(points, list) or len(points) != RATE_POINT_COUNT:
         raise ValueError(
@@ -113,7 +156,16 @@ def load_method_results(
                 result_path,
                 point_index,
             ),
+            "evaluated_frames": _read_frame_count(
+                point,
+                result_path,
+                point_index,
+            ),
         }
+        if normalized[rate_key] <= 0:
+            raise ValueError(
+                f"{result_path}: point {point_index} rate must be positive"
+            )
         for metric in metrics:
             normalized[metric] = _read_number(
                 point,
@@ -121,29 +173,37 @@ def load_method_results(
                 result_path,
                 point_index,
             )
+            if not 0.0 <= normalized[metric] <= 1.0:
+                raise ValueError(
+                    f"{result_path}: point {point_index} {metric} must "
+                    "use the fractional [0, 1] scale"
+                )
         normalized_points.append(normalized)
 
     return {
         "method": str(data.get("method") or fallback_method),
+        "codec": data.get("codec"),
+        "codec_config": data.get("codec_config"),
+        "rate_source": data.get("rate_source"),
         "source_file": str(result_path.resolve()),
         "evaluation_id": data.get("evaluation_id"),
         "task_model": data.get("task_model"),
         "protocol": data.get("protocol"),
+        "ground_truth": data.get("ground_truth"),
+        "detector_config": data.get("detector_config"),
         "points": normalized_points,
     }
 
 
 def validate_shared_protocol(results: list[dict[str, Any]]) -> None:
-    """Reject known protocol mismatches and warn when metadata is incomplete."""
-    for metadata_key in ("evaluation_id", "task_model", "protocol"):
+    """Reject dataset, detector, ground-truth and framing mismatches."""
+    for metadata_key in SHARED_METADATA_KEYS:
         values = [result.get(metadata_key) for result in results]
-        present = [value for value in values if value is not None]
-        if present and len(present) != len(results):
-            print(
-                f"WARNING: '{metadata_key}' is missing from one or more inputs; "
-                "fairness cannot be fully verified."
-            )
-        if len(present) == len(results) and len(set(present)) != 1:
+        serialized = [
+            json.dumps(value, sort_keys=True, separators=(",", ":"))
+            for value in values
+        ]
+        if len(set(serialized)) != 1:
             mapping = {
                 result["method"]: result.get(metadata_key) for result in results
             }
@@ -151,20 +211,30 @@ def validate_shared_protocol(results: list[dict[str, Any]]) -> None:
                 f"All methods must use the same {metadata_key}: {mapping}"
             )
 
+    frame_counts = {}
+    for result in results:
+        counts = {
+            point["evaluated_frames"]
+            for point in result["points"]
+        }
+        if len(counts) != 1:
+            raise ValueError(
+                f"{result['method']} changes evaluated frame count across "
+                f"rate points: {sorted(counts)}"
+            )
+        frame_counts[result["method"]] = counts.pop()
+    if len(set(frame_counts.values())) != 1:
+        raise ValueError(
+            f"All methods must evaluate the same frame count: {frame_counts}"
+        )
+
 
 def validate_metric_scale(results: list[dict[str, Any]], metric: str) -> None:
-    scales = []
     for result in results:
-        maximum = max(point[metric] for point in result["points"])
-        scales.append("percent" if maximum > 1.0 else "fraction")
-    if len(set(scales)) != 1:
-        mapping = {
-            result["method"]: scale
-            for result, scale in zip(results, scales, strict=True)
-        }
-        raise ValueError(
-            f"{metric} mixes fractional and percentage scales across methods: {mapping}"
-        )
+        if any(not 0.0 <= point[metric] <= 1.0 for point in result["points"]):
+            raise ValueError(
+                f"{result['method']} {metric} must use fractional [0, 1] values"
+            )
 
 
 def curve_arrays(
@@ -304,7 +374,7 @@ def plot_rd_curve(
     axis.set_ylabel(
         "mAP@0.5" if metric == "map50" else "mAP@[0.5:0.95]"
     )
-    axis.set_title("HEVC vs Learned Scalable vs Proposed: Rate–Accuracy")
+    axis.set_title("HEVC vs Learned Scalable vs Proposed: Rate-Accuracy")
     axis.grid(True, alpha=0.3)
     axis.legend()
     figure.tight_layout()
@@ -325,16 +395,32 @@ def write_templates(output_dir: Path) -> None:
                     "kbps": None,
                     "map50": None,
                     "map5095": None,
+                    "evaluated_frames": None,
                 }
             )
         template = {
             "schema_version": 1,
             "method": METHOD_TITLES[method_key],
+            "codec": "replace_with_codec_and_version",
+            "codec_config": {},
             "evaluation_id": "replace_with_shared_dataset_and_frame_set_id",
             "task_model": "yolov5s",
+            "ground_truth": "normalized YOLO labels from evaluation manifest",
+            "detector_config": {
+                "model": "yolov5s",
+                "weights_id": (
+                    "torch-hub:yolov5s:ultralytics/yolov5:v7.0"
+                ),
+                "input_size": 640,
+                "confidence_threshold": 0.001,
+                "nms_iou_threshold": 0.6,
+                "max_detections": 300,
+                "feature_repository": "ultralytics/yolov5:v7.0",
+            },
             "protocol": (
                 "external seed excluded; all coded P-frames included"
             ),
+            "rate_source": "replace_with_actual_bitstream_measurement",
             "points": points,
         }
         path = output_dir / f"{method_key}_results_template.json"
@@ -396,10 +482,15 @@ def run_comparison(args: argparse.Namespace) -> None:
                 key: result.get(key)
                 for key in (
                     "method",
+                    "codec",
+                    "codec_config",
+                    "rate_source",
                     "source_file",
                     "evaluation_id",
                     "task_model",
                     "protocol",
+                    "ground_truth",
+                    "detector_config",
                 )
             }
             for result in results
@@ -444,7 +535,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rate",
         choices=("actual_bpp", "kbps"),
-        default="actual_bpp",
+        default="kbps",
     )
     parser.add_argument(
         "--metrics",

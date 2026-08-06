@@ -311,4 +311,10 @@ src/utils/detection_map.py      mAP@0.5 và mAP@[0.5:0.95]
 src/utils/vcm_bitstream.py      actual P-frame sequence container
 train_vcm_final.py              two-stage variable-rate video training
 evaluate_vcm.py                 actual BPP/kbps, mAP, BD-rate và RD curves
+evaluate_hevc.py                HM HEVC encode/decode, actual rate và YOLO mAP
+compare_codecs_bd_rate.py       so sánh HEVC/Learned Scalable/DCVC-RT VCM
 ```
+
+Quy trình tạo HEVC anchor độc lập được mô tả tại
+[HEVC_EVALUATION.md](HEVC_EVALUATION.md). Phần này chỉ dùng khi evaluation,
+không thay đổi hoặc yêu cầu train lại model.

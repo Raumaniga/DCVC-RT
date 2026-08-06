@@ -24,6 +24,12 @@ from src.models.video_model import DMC
 from src.models.yolov5_extractor import load_yolov5
 from src.utils.bd_rate import compute_bd_metric, compute_bd_rate, pareto_front
 from src.utils.detection_map import DetectionMAP
+from src.utils.evaluation_protocol import (
+    EXTERNAL_SEED_PROTOCOL,
+    dataset_summary,
+    detector_config,
+    evaluation_id,
+)
 from src.utils.vcm_bitstream import VCMSequenceReader, VCMSequenceWriter
 from src.utils.vcm_eval_dataset import AnnotatedVideoDataset, VideoSequence
 
@@ -261,7 +267,11 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         ) from error
     model.set_use_two_entropy_coders(False)
 
-    detector = load_yolov5(args.task_model).to(device).eval()
+    detector = load_yolov5(
+        args.task_model,
+        repository=args.yolov5_repo,
+        weights=args.yolov5_weights,
+    ).to(device).eval()
     detector.conf = args.confidence_threshold
     detector.iou = args.nms_iou_threshold
     detector.max_det = args.max_detections
@@ -326,12 +336,29 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         "schema_version": 4,
         "method": args.method_name,
         "codec": "DMC-only P-frame VCM",
-        "protocol": "external seed excluded; all coded P-frames included",
+        "codec_config": {
+            "checkpoint": str(Path(args.video_ckpt).resolve()),
+            "base_qps": list(args.qps),
+            "qp_offsets": list(QP_OFFSETS),
+            "two_entropy_coders": False,
+            "external_seed": True,
+        },
+        "protocol": EXTERNAL_SEED_PROTOCOL,
         "rate_source": "actual sequence-container bytes including headers",
         "rate_points": RATE_POINT_COUNT,
         "task": "object_detection",
         "task_model": args.task_model,
         "ground_truth": "normalized YOLO labels from evaluation manifest",
+        "evaluation_id": evaluation_id(dataset, sequences),
+        "dataset": dataset_summary(dataset, sequences),
+        "detector_config": detector_config(
+            args.task_model,
+            args.detector_size,
+            args.confidence_threshold,
+            args.nms_iou_threshold,
+            args.max_detections,
+            args.yolov5_weights,
+        ),
         "points": points,
     }
     output_path = Path(args.output_dir) / f"{method_name}_results.json"
@@ -346,7 +373,55 @@ def load_results(path: str | Path) -> dict:
         raise ValueError(f"{path} does not use actual-bitstream evaluation schema v4")
     if len(data.get("points", [])) != RATE_POINT_COUNT:
         raise ValueError(f"{path} must contain exactly four rate points")
+    required_metadata = (
+        "evaluation_id",
+        "task_model",
+        "protocol",
+        "ground_truth",
+        "detector_config",
+        "rate_source",
+    )
+    missing = [key for key in required_metadata if data.get(key) is None]
+    if missing:
+        raise ValueError(f"{path} is missing evaluation metadata: {missing}")
     return data
+
+
+def validate_compatible_results(anchor: dict, candidate: dict) -> None:
+    for key in (
+        "evaluation_id",
+        "task_model",
+        "protocol",
+        "ground_truth",
+        "detector_config",
+    ):
+        anchor_value = json.dumps(
+            anchor.get(key),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        candidate_value = json.dumps(
+            candidate.get(key),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if anchor_value != candidate_value:
+            raise ValueError(
+                f"Anchor and candidate must use the same {key}: "
+                f"{anchor.get(key)!r} != {candidate.get(key)!r}"
+            )
+    anchor_frames = {int(point["coded_frames"]) for point in anchor["points"]}
+    candidate_frames = {
+        int(point["coded_frames"])
+        for point in candidate["points"]
+    }
+    if len(anchor_frames) != 1 or len(candidate_frames) != 1:
+        raise ValueError("Evaluated frame count must not change across rate points")
+    if anchor_frames != candidate_frames:
+        raise ValueError(
+            "Anchor and candidate must evaluate the same number of frames: "
+            f"{anchor_frames} != {candidate_frames}"
+        )
 
 
 def curve_arrays(data: dict, rate_key: str, metric: str) -> tuple[np.ndarray, np.ndarray]:
@@ -420,7 +495,7 @@ def plot_rd_curve(
 
     axis.set_xlabel("Actual BPP" if rate_key == "actual_bpp" else "Actual bitrate (kbps)")
     axis.set_ylabel("mAP@0.5" if metric == "map50" else "mAP@[0.5:0.95]")
-    axis.set_title("VCM Rate–Accuracy Curve")
+    axis.set_title("VCM Rate-Accuracy Curve")
     axis.grid(True, alpha=0.3)
     axis.legend()
     figure.tight_layout()
@@ -432,6 +507,7 @@ def plot_rd_curve(
 def compare_bd_rate(args: argparse.Namespace) -> None:
     anchor = load_results(args.anchor_results)
     candidate = load_results(args.candidate_results)
+    validate_compatible_results(anchor, candidate)
     anchor_rate, anchor_quality = curve_arrays(anchor, args.rate, args.metric)
     candidate_rate, candidate_quality = curve_arrays(candidate, args.rate, args.metric)
 
@@ -511,6 +587,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-zero-thres", type=float)
     parser.add_argument("--max-sequences", type=int)
     parser.add_argument("--task-model", default="yolov5s")
+    parser.add_argument("--yolov5-repo")
+    parser.add_argument("--yolov5-weights")
     parser.add_argument("--detector-size", type=int, default=640)
     parser.add_argument("--confidence-threshold", type=float, default=0.001)
     parser.add_argument("--nms-iou-threshold", type=float, default=0.6)

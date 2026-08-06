@@ -169,13 +169,13 @@ Chạy một lần để cache repository và weights:
 
 ```python
 import torch
+from src.models.yolov5_extractor import load_yolov5
 
-model = torch.hub.load(
-    "ultralytics/yolov5:v7.0",
-    "yolov5s",
-    pretrained=True,
-    trust_repo=True,
-)
+# Do not call torch.hub.load directly here. PyTorch >= 2.6 defaults
+# torch.load(weights_only=True), while the trusted YOLOv5 v7 checkpoint
+# contains the legacy models.yolo.Model object. The project loader applies
+# weights_only=False only while loading this pinned YOLOv5 checkpoint.
+model = load_yolov5("yolov5s")
 del model
 torch.cuda.empty_cache()
 print("YOLOv5 online cache=PASS")
