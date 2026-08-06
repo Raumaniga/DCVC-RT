@@ -49,6 +49,7 @@ POC_BITS_PATTERN = re.compile(
     r"\bPOC\s+(-?\d+)\b.*?\)\s+([0-9][0-9,]*)\s+bits\b",
     flags=re.IGNORECASE,
 )
+POC_PROGRESS_PATTERN = re.compile(r"\bPOC\s+(-?\d+)\b", flags=re.IGNORECASE)
 
 
 def safe_name(value: str) -> str:
@@ -154,6 +155,7 @@ def hm_encode(
     qp: int,
     bit_depth: int,
     extra_arguments: list[str],
+    progress: tqdm | None = None,
 ) -> str:
     rounded_fps = int(round(sequence.fps))
     if abs(sequence.fps - rounded_fps) > 1e-6:
@@ -180,7 +182,56 @@ def hm_encode(
         "--InputChromaFormat=420",
         *extra_arguments,
     ]
-    return run_command(command, f"HM encode for {sequence.name} at QP {qp}")
+    # ``subprocess.run`` only returns after HM has encoded the *entire*
+    # sequence.  HM emits one "POC n" line per coded picture, so consume its
+    # output incrementally and expose that information to the notebook.
+    # This is especially useful for the CPU-only HM reference encoder, for
+    # which a low-QP sequence can take many minutes.
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    output_lines: list[str] = []
+    latest_poc = -1
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_lines.append(line)
+            match = POC_PROGRESS_PATTERN.search(line)
+            if match:
+                latest_poc = int(match.group(1))
+                # Updating every picture makes the progress visible without
+                # flooding notebook output with HM's full log.
+                if progress is not None:
+                    progress.set_postfix_str(
+                        f"{sequence.name}: HM {latest_poc + 1}/"
+                        f"{sequence.frame_count} frames"
+                    )
+                    progress.refresh()
+        return_code = process.wait()
+    except BaseException:
+        process.terminate()
+        process.wait()
+        raise
+
+    output = "".join(output_lines)
+    if return_code:
+        tail = "".join(output_lines[-40:])
+        raise RuntimeError(
+            f"HM encode for {sequence.name} at QP {qp} failed with exit code "
+            f"{return_code}.\nCommand: {subprocess.list2cmdline(command)}\n{tail}"
+        )
+    if progress is not None:
+        progress.set_postfix_str(
+            f"{sequence.name}: HM completed ({sequence.frame_count} frames)"
+        )
+        progress.refresh()
+    return output
 
 
 def yuv_to_rgb_frames(
@@ -277,10 +328,18 @@ def evaluate_reconstructions(
     detector_size: int,
     first_image_id: int,
     protocol_key: str,
+    progress_label: str,
 ) -> int:
     first_frame = 0 if protocol_key == "all-frames" else 1
     image_id = first_image_id
-    for frame_index in range(first_frame, sequence.frame_count):
+    frames = range(first_frame, sequence.frame_count)
+    for frame_index in tqdm(
+        frames,
+        total=sequence.frame_count - first_frame,
+        desc=progress_label,
+        unit="frame",
+        leave=False,
+    ):
         detections = detector(
             [as_yolo_image(reconstructed_frames[frame_index])],
             size=detector_size,
@@ -391,6 +450,8 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                 )
 
                 write_concat_file(sequence, concat_path)
+                progress.set_postfix_str(f"{sequence.name}: RGB -> YUV")
+                progress.refresh()
                 rgb_to_yuv(
                     ffmpeg,
                     sequence,
@@ -408,6 +469,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     qp,
                     args.bit_depth,
                     args.hm_extra_arg,
+                    progress,
                 )
                 log_path = (
                     log_root
@@ -417,6 +479,8 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text(encoder_log, encoding="utf-8")
 
+                progress.set_postfix_str(f"{sequence.name}: YUV -> RGB")
+                progress.refresh()
                 reconstructed_frames = yuv_to_rgb_frames(
                     ffmpeg,
                     sequence,
@@ -433,6 +497,7 @@ def evaluate_hevc(args: argparse.Namespace) -> None:
                     args.detector_size,
                     next_image_id,
                     args.protocol,
+                    f"{args.method_name}: QP {qp} YOLO {sequence.name}",
                 )
                 if args.save_reconstructions:
                     destination = (
