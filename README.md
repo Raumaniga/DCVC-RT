@@ -11,7 +11,8 @@ layer dành cho người xem.
      │
      └─> DMC trainable ─> estimated BPP + ảnh giải nén x_hat_t
                                              │
-                                             └─> YOLOv5 clone (frozen)
+                                             └─> YOLOv5 clone (trainable weights,
+                                                   frozen BN statistics)
                                                        │
                                                        └─> {F4_hat_t, F6_hat_t, F9_hat_t}
 
@@ -20,15 +21,25 @@ D_machine = sum_l alpha_l * D_l
 Loss_t = BPP_t + lambda(QP_base) * w_t * D_machine
 ```
 
-Hai YOLOv5 extractor dùng cùng trọng số pretrained và luôn bị đóng băng. Nhánh
-teacher chạy trong `no_grad`. Nhánh ảnh giải nén vẫn cho gradient đi qua input,
-nhưng optimizer chỉ cập nhật DMC.
+Hai nhánh khởi tạo từ cùng trọng số pretrained. Nhánh teacher luôn đóng băng và
+chạy trong `no_grad`; nhánh clone được học chung với DMC. Optimizer vì vậy cập
+nhật cả DMC lẫn cloned front-end, còn YOLO task back-end không được cập nhật.
+BatchNorm của clone giữ thống kê pretrained để batch video nhỏ không làm lệch
+phân phối. Checkpoint lưu riêng cloned front-end và `evaluate_vcm.py` lắp chính
+front-end này vào YOLO back-end đóng băng trước khi đo mAP.
 
 Mặc định Feature MSE lấy ba tầng backbone:
 
 - Layer 4, stride 8: chi tiết không gian và vật thể nhỏ.
 - Layer 6, stride 16: đặc trưng mức giữa.
 - Layer 9, stride 32: ngữ nghĩa sâu.
+
+Ba tầng dùng trọng số bằng nhau sau chuẩn hóa. Đây là thiết kế lai: cơ chế
+trainable clone/front-end–back-end bám theo Learned Scalable Video Coding, còn
+multi-level feature matching lấy cảm hứng từ TransTIC (TransTIC dùng năm mức
+ResNet50-FPN với trọng số bằng nhau, không phải đúng các layer YOLO 4/6/9).
+Vì vậy phải ablation trên tập validation; có thể thay bằng
+`--feature-layer-indices` và `--feature-layer-weights`.
 
 ## Protocol train theo bài DCVC-RT
 
@@ -68,7 +79,8 @@ Loss_t = BPP_t + lambda(QP_base) * w_t * D_machine_t
 Frame 0 là reference seed từ bên ngoài, không nén và không tính loss. Stage
 `vimeo7` dùng 7 vị trí đầu của lịch và mã hóa 6 P-frame. Stage `reds8` dùng đủ
 8 vị trí và mã hóa 7 P-frame. Sau khi lấy trung bình loss các P-frame, chương
-trình backpropagate một lần, clip gradient và cập nhật DMC bằng AdamW.
+trình backpropagate một lần, clip gradient và cập nhật DMC cùng cloned YOLO
+front-end bằng AdamW. Teacher và task back-end luôn đóng băng.
 
 Theo ý tưởng progressive sequence training trong
 [training recipe DCVC-UF](https://github.com/microsoft/DCVC/blob/main/training.md),
@@ -89,6 +101,11 @@ bốn `QP_base = {0, 21, 42, 63}`. Checkpoint `best.pt` được chọn theo tru
 `BPP_estimated + lambda * Feature MSE` của cả bốn rate point, thay vì chỉ QP 32.
 Bộ đếm early stopping và checkpoint `best.pt` được reset khi chuyển độ dài;
 early stopping chỉ được phép kích hoạt sau khi đã đến pha 7 frame.
+
+Loss trên là proxy khả vi cho BD-rate–mAP; NMS và mAP không được đưa trực tiếp
+vào backpropagation. Để chọn model theo mục tiêu cuối, giữ các `epoch_N.pt`, chạy
+actual-bitstream evaluation trên một validation set có nhãn, rồi chọn checkpoint
+có BD-rate–mAP tốt nhất. Không dùng tập test Class D để chọn checkpoint.
 
 Optimizer là AdamW với `weight_decay=1e-4`. Weight decay chỉ áp dụng cho các
 trọng số thông thường; các tham số quantization `q_*`, bias và tham số 1-D dùng
@@ -226,6 +243,10 @@ Các mặc định quan trọng:
 - `save_every=10`, `keep_periodic_checkpoints=2`
 - `feature_layer_indices=[4, 6, 9]`
 - trọng số feature mặc định bằng nhau và được chuẩn hóa
+- cloned YOLO front-end được train mặc định; `--no-train-cloned-frontend` chỉ
+  dùng cho ablation
+- `frontend_learning_rate` mặc định bằng learning rate của DMC; có thể đặt riêng
+  bằng `--frontend-learning-rate`
 
 GPU 4 GB có thể không đủ cho backpropagation xuyên nhiều P-frame với crop 256.
 Khi OOM, giảm `--crop-size` xuống 128 hoặc 64 (vẫn phải chia hết cho 16), giữ
@@ -285,6 +306,10 @@ python evaluate_vcm.py --mode codec `
   --qps 0 21 42 63
 ```
 
+Với checkpoint schema 8, evaluator tự dùng cloned front-end đã train cùng DMC.
+Checkpoint cũ không có phần này sẽ in cảnh báo và dùng YOLO pretrained gốc; hai
+kết quả thuộc hai protocol khác nhau và không nên diễn giải như cùng một model.
+
 Tính BD-rate-mAP và vẽ RD curve:
 
 ```powershell
@@ -306,7 +331,7 @@ Evaluation:  compress -> actual bitstream -> decompress -> ground-truth mAP
 
 ```text
 src/models/video_model.py       DMC video codec
-src/models/vcm_loss.py          frozen YOLO + machine Feature MSE
+src/models/vcm_loss.py          frozen teacher + trainable clone + Feature MSE
 src/utils/dataset.py            Vimeo-90K 7-frame + long-video loader
 src/utils/vcm_eval_dataset.py   full-resolution frames + ground truth
 src/utils/detection_map.py      mAP@0.5 và mAP@[0.5:0.95]

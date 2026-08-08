@@ -21,7 +21,7 @@ from torchvision.transforms import functional as transforms
 from tqdm import tqdm
 
 from src.models.video_model import DMC
-from src.models.yolov5_extractor import load_yolov5
+from src.models.yolov5_extractor import install_cloned_backbone, load_yolov5
 from src.utils.bd_rate import compute_bd_metric, compute_bd_rate, pareto_front
 from src.utils.detection_map import DetectionMAP
 from src.utils.evaluation_protocol import (
@@ -38,8 +38,9 @@ QP_OFFSETS = (0, 8, 0, 4, 0, 4, 0, 4)
 RATE_POINT_COUNT = 4
 
 
-def load_dmc_weights(model: DMC, path: str | Path, device: torch.device) -> None:
-    checkpoint = torch.load(path, map_location=device)
+def load_codec_checkpoint(model: DMC, path: str | Path) -> dict:
+    """Load DMC weights and return metadata needed by the machine front end."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(checkpoint, dict):
         state = checkpoint.get(
             "dmc_state_dict",
@@ -50,6 +51,7 @@ def load_dmc_weights(model: DMC, path: str | Path, device: torch.device) -> None
     model.load_state_dict(
         {key.removeprefix("module."): value for key, value in state.items()}
     )
+    return checkpoint if isinstance(checkpoint, dict) else {}
 
 
 def safe_name(value: str) -> str:
@@ -257,7 +259,7 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         raise RuntimeError("No evaluation sequences were selected")
 
     model = DMC().to(device).eval()
-    load_dmc_weights(model, args.video_ckpt, device)
+    checkpoint = load_codec_checkpoint(model, args.video_ckpt)
     try:
         model.update(force_zero_thres=args.force_zero_thres)
     except ImportError as error:
@@ -271,7 +273,61 @@ def evaluate_codec(args: argparse.Namespace) -> None:
         args.task_model,
         repository=args.yolov5_repo,
         weights=args.yolov5_weights,
-    ).to(device).eval()
+    )
+    feature_objective = checkpoint.get("feature_objective", {})
+    cloned_frontend_state = checkpoint.get("cloned_frontend_state_dict")
+    if cloned_frontend_state is not None:
+        trained_task_model = feature_objective.get("task_model")
+        if trained_task_model is not None and trained_task_model != args.task_model:
+            raise ValueError(
+                "Checkpoint cloned front end was trained for "
+                f"{trained_task_model}, not --task-model {args.task_model}"
+            )
+        last_backbone_layer = feature_objective.get("last_backbone_layer")
+        if last_backbone_layer is None:
+            last_backbone_layer = max(
+                int(key.split(".", 1)[0]) for key in cloned_frontend_state
+            )
+        last_backbone_layer = int(last_backbone_layer)
+        install_cloned_backbone(
+            detector,
+            cloned_frontend_state,
+            last_backbone_layer,
+        )
+        machine_frontend = {
+            "type": "checkpoint_cloned_yolov5_frontend",
+            "trainable_during_codec_training": bool(
+                checkpoint.get("optimizer_config", {}).get(
+                    "train_cloned_frontend",
+                    False,
+                )
+            ),
+            "last_backbone_layer": last_backbone_layer,
+            "feature_layer_indices": list(
+                feature_objective.get("layer_indices", ())
+            ),
+            "normalized_layer_weights": feature_objective.get(
+                "normalized_layer_weights"
+            ),
+            "task_backend": "frozen_pretrained_yolov5",
+        }
+        print(
+            "Evaluation detector uses the trained cloned YOLO front end "
+            f"(layers 0..{last_backbone_layer}) and frozen task back end."
+        )
+    else:
+        machine_frontend = {
+            "type": "pretrained_yolov5_frontend",
+            "trainable_during_codec_training": False,
+            "task_backend": "frozen_pretrained_yolov5",
+            "legacy_checkpoint_without_clone": True,
+        }
+        print(
+            "Checkpoint has no cloned YOLO front end; evaluation falls back "
+            "to the pretrained detector (legacy/frozen-feature protocol)."
+        )
+    detector = detector.to(device).eval()
+    del checkpoint, cloned_frontend_state
     detector.conf = args.confidence_threshold
     detector.iou = args.nms_iou_threshold
     detector.max_det = args.max_detections
@@ -359,6 +415,7 @@ def evaluate_codec(args: argparse.Namespace) -> None:
             args.max_detections,
             args.yolov5_weights,
         ),
+        "machine_frontend": machine_frontend,
         "points": points,
     }
     output_path = Path(args.output_dir) / f"{method_name}_results.json"

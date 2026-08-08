@@ -16,10 +16,10 @@ from .yolov5_extractor import DEFAULT_FEATURE_LAYER_INDICES, YOLOv5FeatureExtrac
 class VCMLoss(nn.Module):
     """Rate plus YOLO task-feature distortion.
 
-    The teacher extracts target features from the uncompressed frame under
-    ``no_grad``. The reconstruction extractor is also frozen, but its input
-    path remains differentiable so its Feature-MSE updates only the DMC video
-    codec. Neither YOLO extractor is part of the optimizer.
+    The teacher extracts targets from uncompressed frames under ``no_grad``.
+    The reconstruction extractor is a cloned YOLO front end and is jointly
+    optimized with DMC by default.  Its BatchNorm statistics remain frozen and
+    the original teacher remains completely frozen.
     """
 
     def __init__(
@@ -29,6 +29,7 @@ class VCMLoss(nn.Module):
         feature_layer_weights: Sequence[float] | None = None,
         yolov5_repository: str | Path | None = None,
         yolov5_weights: str | Path | None = None,
+        train_cloned_frontend: bool = True,
     ):
         super().__init__()
         self.feature_layer_indices = tuple(int(index) for index in feature_layer_indices)
@@ -52,12 +53,38 @@ class VCMLoss(nn.Module):
             self.feature_layer_indices,
             repository=yolov5_repository,
             weights=yolov5_weights,
+            trainable=False,
         )
         self.reconstruction_extractor = copy.deepcopy(self.teacher_extractor)
+        self.train_cloned_frontend = bool(train_cloned_frontend)
+        self.reconstruction_extractor.set_trainable(self.train_cloned_frontend)
+
+    @property
+    def last_backbone_layer(self) -> int:
+        return self.reconstruction_extractor.last_backbone_layer
+
+    def cloned_frontend_state_dict(self) -> dict[str, torch.Tensor]:
+        return self.reconstruction_extractor.backbone_prefix.state_dict()
+
+    def load_cloned_frontend_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        self.reconstruction_extractor.backbone_prefix.load_state_dict(
+            state_dict,
+            strict=True,
+        )
+
+    def cloned_frontend_named_parameters(self):
+        if not self.train_cloned_frontend:
+            return iter(())
+        return self.reconstruction_extractor.backbone_prefix.named_parameters()
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.teacher_extractor.eval()
+        # Trainable weights still receive gradients in eval mode.  Keeping this
+        # prefix in eval prevents tiny video batches from corrupting BN state.
         self.reconstruction_extractor.eval()
         return self
 

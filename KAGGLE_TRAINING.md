@@ -192,8 +192,10 @@ Thêm vào mọi lệnh train:
 --yolov5-weights /kaggle/input/yolov5-v7-offline/yolov5s.pt
 ```
 
-Script chỉ load YOLO một lần rồi clone frozen backbone cho hai nhánh teacher và
-reconstruction.
+Script chỉ load YOLO một lần rồi sao chép backbone. Teacher đóng băng; clone giữ
+BatchNorm ở eval nhưng trọng số được optimizer học chung với DMC. `latest.pt`,
+`best.pt` và `epoch_N.pt` đều lưu cloned front-end để evaluation dùng đúng mạng
+đã train.
 
 ## 7. Chạy smoke test trước
 
@@ -421,6 +423,22 @@ codec. `best.pt` tối thiểu hóa mean validation loss của bốn rate point.
 estimated BPP + Feature MSE trên tập validation, không phải actual-bitstream mAP;
 mAP và BD-rate vẫn được đo riêng bằng `evaluate_vcm.py` sau khi train.
 
+Mặc định script dùng thiết kế lai Learned Scalable + TransTIC-inspired:
+
+```bash
+--train-cloned-frontend \
+--feature-layer-indices 4 6 9 \
+--feature-layer-weights 1 1 1
+```
+
+Ba trọng số được chuẩn hóa thành `1/3`. Đây không phải bộ trọng số đã được paper
+chứng minh tối ưu cho YOLOv5; hãy giữ các periodic checkpoint và chọn bằng
+BD-rate–mAP trên validation set có nhãn. Không chọn bằng Class D test set.
+
+Checkpoint cũ không chứa clone không thể `--resume` vào optimizer mới. Có thể
+dùng checkpoint đó qua `--video-init`: DMC được kế thừa, còn clone khởi tạo từ
+YOLO pretrained rồi bắt đầu joint training.
+
 ## 12. Xử lý CUDA OOM
 
 Thực hiện theo thứ tự:
@@ -475,3 +493,6 @@ actual BPP → mAP@0.5 / mAP@[0.5:0.95] → RD curve → BD-rate
 ```
 
 Evaluation bằng actual bitstream mới cần build `src/cpp`; training không cần.
+`evaluate_vcm.py` tự đọc cloned front-end từ checkpoint schema 8 và ghép nó với
+YOLO task back-end đóng băng. Nếu log báo fallback sang pretrained front-end thì
+đó là checkpoint legacy, chưa phải joint-trained Learned-Scalable-style model.

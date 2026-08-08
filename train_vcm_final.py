@@ -171,7 +171,13 @@ def resolve_validation_qps(args: argparse.Namespace) -> tuple[int, ...]:
     return validation_qps
 
 
-def load_dmc_weights(model: DMC, path: str | Path, device: torch.device):
+def load_initial_weights(
+    model: DMC,
+    criterion: VCMLoss,
+    path: str | Path,
+    device: torch.device,
+) -> None:
+    """Load DMC and, when present, the jointly trained cloned front end."""
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     if isinstance(checkpoint, dict):
         state = checkpoint.get(
@@ -181,6 +187,19 @@ def load_dmc_weights(model: DMC, path: str | Path, device: torch.device):
     else:
         state = checkpoint
     model.load_state_dict({key.removeprefix("module."): value for key, value in state.items()})
+    cloned_state = (
+        checkpoint.get("cloned_frontend_state_dict")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if cloned_state is not None:
+        criterion.load_cloned_frontend_state_dict(cloned_state)
+        print(f"Loaded DMC and cloned YOLO front end from {path}")
+    else:
+        print(
+            f"Loaded DMC from {path}; cloned YOLO front end starts from the "
+            "pretrained teacher weights"
+        )
 
 
 def make_loader(
@@ -276,31 +295,56 @@ def aggregate(entries: list[dict[str, torch.Tensor]]) -> dict[str, float]:
 
 def make_optimizer(
     dmc: DMC,
+    criterion: VCMLoss,
     learning_rate: float,
+    frontend_learning_rate: float,
     weight_decay: float,
 ) -> optim.AdamW:
     """Build AdamW without decaying quantization controls, biases or 1-D scales."""
-    decay_parameters = []
-    no_decay_parameters = []
-    for name, parameter in dmc.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        leaf_name = name.rsplit(".", 1)[-1]
-        no_decay = (
-            parameter.ndim <= 1
-            or leaf_name == "bias"
-            or leaf_name.startswith("q_")
-        )
-        target = no_decay_parameters if no_decay else decay_parameters
-        target.append(parameter)
-
-    return optim.AdamW(
-        [
-            {"params": decay_parameters, "weight_decay": weight_decay},
-            {"params": no_decay_parameters, "weight_decay": 0.0},
-        ],
-        lr=learning_rate,
+    parameter_groups = []
+    sources = (
+        ("dmc", dmc.named_parameters(), learning_rate),
+        (
+            "cloned_frontend",
+            criterion.cloned_frontend_named_parameters(),
+            frontend_learning_rate,
+        ),
     )
+    for source, named_parameters, source_learning_rate in sources:
+        decay_parameters = []
+        no_decay_parameters = []
+        for name, parameter in named_parameters:
+            if not parameter.requires_grad:
+                continue
+            leaf_name = name.rsplit(".", 1)[-1]
+            no_decay = (
+                parameter.ndim <= 1
+                or leaf_name == "bias"
+                or leaf_name.startswith("q_")
+            )
+            target = no_decay_parameters if no_decay else decay_parameters
+            target.append(parameter)
+        if decay_parameters:
+            parameter_groups.append(
+                {
+                    "params": decay_parameters,
+                    "weight_decay": weight_decay,
+                    "lr": source_learning_rate,
+                    "source": source,
+                }
+            )
+        if no_decay_parameters:
+            parameter_groups.append(
+                {
+                    "params": no_decay_parameters,
+                    "weight_decay": 0.0,
+                    "lr": source_learning_rate,
+                    "source": source,
+                }
+            )
+    if not parameter_groups:
+        raise RuntimeError("No trainable DMC or cloned-front-end parameters")
+    return optim.AdamW(parameter_groups, lr=learning_rate)
 
 
 @torch.no_grad()
@@ -400,6 +444,7 @@ class TrainingLogger:
 def restore(
     path: str | None,
     dmc: DMC,
+    criterion: VCMLoss,
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.LRScheduler,
     device: torch.device,
@@ -415,6 +460,14 @@ def restore(
             "This resume checkpoint does not contain a compatible AdamW state. "
             "Load its DMC weights with --video-init instead."
         )
+    saved_train_clone = bool(
+        optimizer_config.get("train_cloned_frontend", False)
+    )
+    if saved_train_clone != criterion.train_cloned_frontend:
+        raise ValueError(
+            "Resume checkpoint and current --train-cloned-frontend setting "
+            "do not match. Use --video-init for a new training run instead."
+        )
     saved_stage = checkpoint.get("training_stage")
     normalized_saved_stage = TRAINING_STAGE_ALIASES.get(saved_stage, saved_stage)
     if normalized_saved_stage is not None and normalized_saved_stage != training_stage:
@@ -422,7 +475,40 @@ def restore(
             f"Checkpoint stage is {saved_stage}, but --training-stage is "
             f"{training_stage}. Use --video-init for a stage transition."
         )
+    saved_objective = checkpoint.get("feature_objective", {})
+    saved_layers = tuple(saved_objective.get("layer_indices", ()))
+    if saved_layers and saved_layers != criterion.feature_layer_indices:
+        raise ValueError(
+            "Resume checkpoint feature layers do not match the current "
+            "--feature-layer-indices. Use --video-init for a new run."
+        )
+    saved_weights = saved_objective.get("normalized_layer_weights")
+    current_weights = criterion.layer_weights.detach().cpu().tolist()
+    if saved_weights is not None and (
+        len(saved_weights) != len(current_weights)
+        or any(
+            abs(float(saved) - float(current)) > 1e-7
+            for saved, current in zip(
+                saved_weights,
+                current_weights,
+                strict=True,
+            )
+        )
+    ):
+        raise ValueError(
+            "Resume checkpoint feature weights do not match the current "
+            "--feature-layer-weights. Use --video-init for a new run."
+        )
     dmc.load_state_dict(checkpoint["dmc_state_dict"])
+    cloned_state = checkpoint.get("cloned_frontend_state_dict")
+    if criterion.train_cloned_frontend and cloned_state is None:
+        raise ValueError(
+            "This legacy checkpoint has no trainable cloned YOLO front end. "
+            "Start the new joint-training protocol with --video-init instead "
+            "of --resume."
+        )
+    if cloned_state is not None:
+        criterion.load_cloned_frontend_state_dict(cloned_state)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     training_state = checkpoint.get("training_state", {})
@@ -466,10 +552,11 @@ def save_checkpoint(
     checkpoint_selection: dict[str, object],
 ):
     payload = {
-        "schema_version": 7,
+        "schema_version": 8,
         "epoch": epoch,
         "training_stage": schedule.name,
         "dmc_state_dict": dmc.state_dict(),
+        "cloned_frontend_state_dict": criterion.cloned_frontend_state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "metrics": metrics,
@@ -493,14 +580,25 @@ def save_checkpoint(
         "optimizer_config": {
             "name": "AdamW",
             "learning_rate": args.learning_rate,
+            "frontend_learning_rate": args.frontend_learning_rate,
             "weight_decay": args.weight_decay,
             "quantization_and_bias_weight_decay": 0.0,
+            "train_cloned_frontend": criterion.train_cloned_frontend,
         },
         "feature_objective": {
+            "task_model": args.task_model,
             "layer_indices": criterion.feature_layer_indices,
+            "last_backbone_layer": criterion.last_backbone_layer,
             "normalized_layer_weights": criterion.layer_weights.detach()
             .cpu()
             .tolist(),
+            "teacher_frontend": "frozen_pretrained",
+            "reconstruction_frontend": (
+                "jointly_trainable_clone"
+                if criterion.train_cloned_frontend
+                else "frozen_clone_ablation"
+            ),
+            "batch_norm_statistics": "frozen",
         },
     }
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -539,6 +637,10 @@ def train(args: argparse.Namespace):
         raise ValueError("crop_size must be divisible by 16 for DCVC-RT")
     if args.weight_decay < 0:
         raise ValueError("weight_decay must be non-negative")
+    if args.frontend_learning_rate is None:
+        args.frontend_learning_rate = args.learning_rate
+    if args.frontend_learning_rate <= 0:
+        raise ValueError("frontend_learning_rate must be positive")
     if args.validate_every < 1:
         raise ValueError("validate_every must be at least 1")
     if args.save_every < 0:
@@ -595,17 +697,41 @@ def train(args: argparse.Namespace):
     )
 
     dmc = DMC().to(device)
-    if args.video_init:
-        load_dmc_weights(dmc, args.video_init, device)
     criterion = VCMLoss(
         args.task_model,
         args.feature_layer_indices,
         args.feature_layer_weights,
         yolov5_repository=args.yolov5_repo,
         yolov5_weights=args.yolov5_weights,
+        train_cloned_frontend=args.train_cloned_frontend,
     ).to(device)
+    if args.video_init:
+        load_initial_weights(dmc, criterion, args.video_init, device)
     metric_names = (*METRICS, *criterion.layer_metric_names)
-    optimizer = make_optimizer(dmc, args.learning_rate, args.weight_decay)
+    optimizer = make_optimizer(
+        dmc,
+        criterion,
+        args.learning_rate,
+        args.frontend_learning_rate,
+        args.weight_decay,
+    )
+    trainable_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    trainable_dmc = sum(
+        parameter.numel() for parameter in dmc.parameters() if parameter.requires_grad
+    )
+    trainable_frontend = sum(
+        parameter.numel()
+        for parameter in criterion.reconstruction_extractor.parameters()
+        if parameter.requires_grad
+    )
+    print(
+        f"trainable parameters: DMC={trainable_dmc:,}, "
+        f"cloned_yolo_frontend={trainable_frontend:,}"
+    )
     scheduler = optim.lr_scheduler.MultiStepLR(
         optimizer,
         milestones=args.lr_milestones,
@@ -614,6 +740,7 @@ def train(args: argparse.Namespace):
     restored_state = restore(
         args.resume,
         dmc,
+        criterion,
         optimizer,
         scheduler,
         device,
@@ -670,7 +797,7 @@ def train(args: argparse.Namespace):
                     continue
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    dmc.parameters(),
+                    trainable_parameters,
                     args.grad_clip,
                 )
                 if not torch.isfinite(grad_norm):
@@ -837,6 +964,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument(
+        "--frontend-learning-rate",
+        type=float,
+        help=(
+            "Learning rate for the cloned YOLO front end; defaults to "
+            "--learning-rate"
+        ),
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=1e-4,
@@ -906,6 +1041,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of newest epoch_N.pt snapshots to retain",
     )
     parser.add_argument("--task-model", default="yolov5s")
+    parser.add_argument(
+        "--train-cloned-frontend",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Jointly optimize the cloned YOLO front end with DMC (default); "
+            "use --no-train-cloned-frontend only for the frozen-feature ablation"
+        ),
+    )
     parser.add_argument(
         "--yolov5-repo",
         help="Optional local YOLOv5 v7 repository for Kaggle offline training",
