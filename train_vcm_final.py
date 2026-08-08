@@ -34,6 +34,7 @@ QP_OFFSETS = (0, 8, 0, 4, 0, 4, 0, 4)
 HIERARCHICAL_DISTORTION_WEIGHTS = (0.5, 1.2, 0.5, 0.9, 0.5, 1.2, 0.5, 0.9)
 DEFAULT_VIMEO_CURRICULUM_FRAMES = (2, 3, 5, 7)
 DEFAULT_VIMEO_CURRICULUM_START_EPOCHS = (1, 6, 11, 21)
+DEFAULT_VALIDATION_QPS = (0, 21, 42, 63)
 METRICS = (
     "total_loss",
     "estimated_bpp",
@@ -61,6 +62,14 @@ class RestoredTrainingState:
     best_loss: float = float("inf")
     stale_validations: int = 0
     active_num_frames: int | None = None
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    """Four-rate validation metrics used to select the best checkpoint."""
+
+    mean: dict[str, float]
+    by_qp: dict[int, dict[str, float]]
 
 
 def get_training_schedule(stage: str) -> TrainingSchedule:
@@ -128,6 +137,38 @@ def interpolate_lambda(base_qp: int, lambda_min: float, lambda_max: float) -> fl
         math.log(lambda_min)
         + position * (math.log(lambda_max) - math.log(lambda_min))
     )
+
+
+def resolve_validation_qps(args: argparse.Namespace) -> tuple[int, ...]:
+    """Normalize the four-rate validation protocol and support the old flag."""
+    configured_qps = getattr(args, "validation_qps", None)
+    legacy_qp = getattr(args, "validation_qp", None)
+    if configured_qps is not None and legacy_qp is not None:
+        raise ValueError(
+            "Use --validation-qps or the deprecated --validation-qp, not both"
+        )
+    if legacy_qp is not None:
+        validation_qps = (int(legacy_qp),)
+        print(
+            "warning: --validation-qp is deprecated; use "
+            f"--validation-qps {' '.join(map(str, validation_qps))}"
+        )
+    else:
+        validation_qps = tuple(
+            int(qp)
+            for qp in (
+                configured_qps
+                if configured_qps is not None
+                else DEFAULT_VALIDATION_QPS
+            )
+        )
+    if not validation_qps:
+        raise ValueError("validation_qps must contain at least one QP")
+    if len(set(validation_qps)) != len(validation_qps):
+        raise ValueError("validation_qps must not contain duplicate values")
+    if any(not 0 <= qp <= 63 for qp in validation_qps):
+        raise ValueError("every validation QP must be in [0, 63]")
+    return validation_qps
 
 
 def load_dmc_weights(model: DMC, path: str | Path, device: torch.device):
@@ -269,16 +310,30 @@ def validate(
     loader: DataLoader,
     args: argparse.Namespace,
     device: torch.device,
-) -> dict[str, float]:
+) -> ValidationResult:
+    """Validate every deterministic clip at all configured rate points."""
     dmc.eval()
     criterion.eval()
-    entries = []
+    entries_by_qp = {qp: [] for qp in args.validation_qps}
     for batch_index, frames in enumerate(loader):
         if args.max_validation_batches is not None and batch_index >= args.max_validation_batches:
             break
-        _, details = run_gop(dmc, criterion, frames.to(device), args.validation_qp, args)
-        entries.append({key: value.detach() for key, value in details.items()})
-    return aggregate(entries)
+        frames = frames.to(device)
+        for base_qp in args.validation_qps:
+            _, details = run_gop(dmc, criterion, frames, base_qp, args)
+            entries_by_qp[base_qp].append(
+                {key: value.detach() for key, value in details.items()}
+            )
+
+    by_qp = {
+        base_qp: aggregate(entries)
+        for base_qp, entries in entries_by_qp.items()
+    }
+    mean = {
+        key: sum(metrics[key] for metrics in by_qp.values()) / len(by_qp)
+        for key in next(iter(by_qp.values()))
+    }
+    return ValidationResult(mean=mean, by_qp=by_qp)
 
 
 class TrainingLogger:
@@ -291,6 +346,7 @@ class TrainingLogger:
         directory.mkdir(parents=True, exist_ok=True)
         run_name = f"video_vcm_{datetime.now():%Y%m%d_%H%M%S}"
         self.metric_names = metric_names
+        self.validation_qps = tuple(args.validation_qps)
         self.path = directory / f"{run_name}.csv"
         self.file = self.path.open("w", newline="", encoding="utf-8")
         self.writer = csv.DictWriter(
@@ -300,6 +356,11 @@ class TrainingLogger:
                 "learning_rate",
                 *[f"train_{key}" for key in self.metric_names],
                 *[f"val_{key}" for key in self.metric_names],
+                *[
+                    f"val_qp{qp}_{key}"
+                    for qp in self.validation_qps
+                    for key in self.metric_names
+                ],
             ],
         )
         self.writer.writeheader()
@@ -311,6 +372,7 @@ class TrainingLogger:
         learning_rate: float,
         train_metrics: dict[str, float],
         val_metrics: dict[str, float] | None,
+        val_metrics_by_qp: dict[int, dict[str, float]] | None,
     ):
         row = {"epoch": epoch, "learning_rate": learning_rate}
         row.update(
@@ -320,6 +382,14 @@ class TrainingLogger:
             row.update(
                 {f"val_{key}": val_metrics[key] for key in self.metric_names}
             )
+        if val_metrics_by_qp is not None:
+            for qp, metrics in val_metrics_by_qp.items():
+                row.update(
+                    {
+                        f"val_qp{qp}_{key}": metrics[key]
+                        for key in self.metric_names
+                    }
+                )
         self.writer.writerow(row)
         self.file.flush()
 
@@ -334,6 +404,7 @@ def restore(
     scheduler: optim.lr_scheduler.LRScheduler,
     device: torch.device,
     training_stage: str,
+    checkpoint_selection: dict[str, object],
 ) -> RestoredTrainingState:
     if path is None:
         return RestoredTrainingState()
@@ -355,10 +426,25 @@ def restore(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     training_state = checkpoint.get("training_state", {})
+    saved_selection = checkpoint.get("checkpoint_selection")
+    selection_matches = saved_selection == checkpoint_selection
+    if not selection_matches:
+        print(
+            "Checkpoint-selection protocol changed; retaining model/optimizer "
+            "state but resetting best loss and early-stopping counter."
+        )
     return RestoredTrainingState(
         start_epoch=int(checkpoint["epoch"]) + 1,
-        best_loss=float(training_state.get("best_loss", float("inf"))),
-        stale_validations=int(training_state.get("stale_validations", 0)),
+        best_loss=(
+            float(training_state.get("best_loss", float("inf")))
+            if selection_matches
+            else float("inf")
+        ),
+        stale_validations=(
+            int(training_state.get("stale_validations", 0))
+            if selection_matches
+            else 0
+        ),
         active_num_frames=training_state.get("active_num_frames"),
     )
 
@@ -371,20 +457,24 @@ def save_checkpoint(
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.LRScheduler,
     metrics: dict[str, float],
+    validation_metrics_by_qp: dict[int, dict[str, float]] | None,
     schedule: TrainingSchedule,
     active_num_frames: int,
     best_loss: float,
     stale_validations: int,
     args: argparse.Namespace,
+    checkpoint_selection: dict[str, object],
 ):
     payload = {
-        "schema_version": 6,
+        "schema_version": 7,
         "epoch": epoch,
         "training_stage": schedule.name,
         "dmc_state_dict": dmc.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "metrics": metrics,
+        "validation_metrics_by_qp": validation_metrics_by_qp,
+        "checkpoint_selection": checkpoint_selection,
         "training_schedule": {
             "pictures_per_group": schedule.num_frames,
             "qp_offsets": schedule.qp_offsets,
@@ -444,6 +534,7 @@ def train(args: argparse.Namespace):
         args.training_stage,
         args.training_stage,
     )
+    args.validation_qps = resolve_validation_qps(args)
     if args.crop_size % 16:
         raise ValueError("crop_size must be divisible by 16 for DCVC-RT")
     if args.weight_decay < 0:
@@ -487,6 +578,16 @@ def train(args: argparse.Namespace):
         if args.val_dir
         else None
     )
+    checkpoint_selection = {
+        "metric": (
+            "mean_validation_total_loss_over_qps"
+            if validation_loader is not None
+            else "mean_training_total_loss"
+        ),
+        "validation_qps": (
+            tuple(args.validation_qps) if validation_loader is not None else ()
+        ),
+    }
     print(
         f"stage={schedule.name}, frames={schedule.num_frames}, "
         f"train_samples={len(train_loader.dataset)}, "
@@ -517,6 +618,7 @@ def train(args: argparse.Namespace):
         scheduler,
         device,
         args.training_stage,
+        checkpoint_selection,
     )
 
     checkpoint_dir = Path(
@@ -592,14 +694,26 @@ def train(args: argparse.Namespace):
                 or epoch % args.validate_every == 0
                 or epoch == args.epochs
             )
-            val_metrics = (
+            validation_result = (
                 validate(dmc, criterion, validation_loader, args, device)
                 if should_validate
                 else None
             )
+            val_metrics = (
+                validation_result.mean if validation_result is not None else None
+            )
+            val_metrics_by_qp = (
+                validation_result.by_qp if validation_result is not None else None
+            )
             epoch_learning_rate = optimizer.param_groups[0]["lr"]
             scheduler.step()
-            logger.log(epoch, epoch_learning_rate, train_metrics, val_metrics)
+            logger.log(
+                epoch,
+                epoch_learning_rate,
+                train_metrics,
+                val_metrics,
+                val_metrics_by_qp,
+            )
 
             print(
                 f"epoch {epoch}: loss={train_metrics['total_loss']:.6f}, "
@@ -610,10 +724,18 @@ def train(args: argparse.Namespace):
             )
             if val_metrics is not None:
                 print(
-                    f"validation: loss={val_metrics['total_loss']:.6f}, "
+                    f"validation mean qps={list(args.validation_qps)}: "
+                    f"loss={val_metrics['total_loss']:.6f}, "
                     f"bpp={val_metrics['estimated_bpp']:.6f}, "
                     f"feature_mse={val_metrics['feature_mse']:.8f}"
                 )
+                for validation_qp, qp_metrics in val_metrics_by_qp.items():
+                    print(
+                        f"  qp {validation_qp}: "
+                        f"loss={qp_metrics['total_loss']:.6f}, "
+                        f"bpp={qp_metrics['estimated_bpp']:.6f}, "
+                        f"feature_mse={qp_metrics['feature_mse']:.8f}"
+                    )
             selection_metrics = (
                 val_metrics
                 if validation_loader is not None
@@ -649,11 +771,13 @@ def train(args: argparse.Namespace):
                 optimizer,
                 scheduler,
                 checkpoint_metrics,
+                val_metrics_by_qp,
                 schedule,
                 active_num_frames,
                 best_loss,
                 stale_validations,
                 args,
+                checkpoint_selection,
             )
             if improved:
                 copy_checkpoint(latest_checkpoint, checkpoint_dir / "best.pt")
@@ -736,7 +860,21 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_VIMEO_CURRICULUM_START_EPOCHS,
         help="Epoch where each Vimeo7 temporal crop length becomes active",
     )
-    parser.add_argument("--validation-qp", type=int, default=32, choices=range(64))
+    parser.add_argument(
+        "--validation-qps",
+        type=int,
+        nargs="+",
+        help=(
+            "Base QPs used for checkpoint validation (default: 0 21 42 63); "
+            "best.pt minimizes mean estimated rate + Feature MSE across them"
+        ),
+    )
+    parser.add_argument(
+        "--validation-qp",
+        type=int,
+        choices=range(64),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--validate-every",
         type=int,
@@ -749,8 +887,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-validation-batches",
         type=int,
-        default=100,
-        help="Number of deterministic validation batches per check",
+        default=25,
+        help=(
+            "Number of deterministic clips per validation check; every clip is "
+            "evaluated at each --validation-qps point"
+        ),
     )
     parser.add_argument(
         "--save-every",

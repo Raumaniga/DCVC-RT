@@ -84,9 +84,11 @@ epoch 21+:    7 frame = 1 seed + 6 P-frame
 Curriculum này giúp DMC thích nghi dần từ objective codec pretrained sang
 Feature MSE trước khi học tích lũy sai số qua cả chuỗi. Mỗi lần validation luôn
 dùng đủ 7 frame. Có thể đổi lịch bằng `--vimeo-curriculum-frames` và
-`--vimeo-curriculum-start-epochs`. Bộ đếm early stopping và checkpoint `best.pt`
-được reset khi chuyển độ dài; early stopping chỉ được phép kích hoạt sau khi đã
-đến pha 7 frame.
+`--vimeo-curriculum-start-epochs`. Mỗi lần validation, từng clip được kiểm tra ở
+bốn `QP_base = {0, 21, 42, 63}`. Checkpoint `best.pt` được chọn theo trung bình
+`BPP_estimated + lambda * Feature MSE` của cả bốn rate point, thay vì chỉ QP 32.
+Bộ đếm early stopping và checkpoint `best.pt` được reset khi chuyển độ dài;
+early stopping chỉ được phép kích hoạt sau khi đã đến pha 7 frame.
 
 Optimizer là AdamW với `weight_decay=1e-4`. Weight decay chỉ áp dụng cho các
 trọng số thông thường; các tham số quantization `q_*`, bias và tham số 1-D dùng
@@ -219,8 +221,8 @@ Các mặc định quan trọng:
 - `optimizer=AdamW`, `weight_decay=1e-4`
 - Vimeo curriculum: `2 → 3 → 5 → 7` tại epoch `1, 6, 11, 21`
 - `lambda_min=1`, `lambda_max=768`
-- `validation_qp=32`
-- `validate_every=5`, `max_validation_batches=100`
+- `validation_qps=[0, 21, 42, 63]`
+- `validate_every=5`, `max_validation_batches=25`; mỗi clip được chạy ở cả 4 QP
 - `save_every=10`, `keep_periodic_checkpoints=2`
 - `feature_layer_indices=[4, 6, 9]`
 - trọng số feature mặc định bằng nhau và được chuẩn hóa

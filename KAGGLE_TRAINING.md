@@ -253,7 +253,8 @@ Kaggle session:
   --num-workers 2 \
   --epochs 100 \
   --validate-every 5 \
-  --max-validation-batches 100 \
+  --validation-qps 0 21 42 63 \
+  --max-validation-batches 25 \
   --save-every 10 \
   --keep-periodic-checkpoints 2
 ```
@@ -278,7 +279,8 @@ Giới hạn số update trong một epoch để mỗi epoch chắc chắn kết
   --epochs 100 \
   --max-batches 1000 \
   --validate-every 5 \
-  --max-validation-batches 100 \
+  --validation-qps 0 21 42 63 \
+  --max-validation-batches 25 \
   --save-every 10 \
   --keep-periodic-checkpoints 2
 ```
@@ -386,7 +388,8 @@ print("REDS check=PASS")
   --epochs 100 \
   --max-batches 1000 \
   --validate-every 5 \
-  --max-validation-batches 100 \
+  --validation-qps 0 21 42 63 \
+  --max-validation-batches 25 \
   --save-every 10 \
   --keep-periodic-checkpoints 2
 ```
@@ -411,6 +414,12 @@ Stage 2 resume:
 Không dùng `--resume` từ Stage 1 cho Stage 2. Chuyển stage phải dùng
 `--video-init .../vcm_vimeo7/best.pt`. Tên stage cũ `long8` vẫn được chấp nhận
 như alias để resume checkpoint cũ, nhưng run mới nên dùng `reds8`.
+
+Validation mặc định dùng bốn `QP_base = {0, 21, 42, 63}`. Mỗi validation clip
+được chạy bốn lần, nên `--max-validation-batches 25` tương ứng 100 lượt chạy
+codec. `best.pt` tối thiểu hóa mean validation loss của bốn rate point. Đây là
+estimated BPP + Feature MSE trên tập validation, không phải actual-bitstream mAP;
+mAP và BD-rate vẫn được đo riêng bằng `evaluate_vcm.py` sau khi train.
 
 ## 12. Xử lý CUDA OOM
 
